@@ -140,8 +140,16 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
     for source in &config.sources {
         let root = crate::config::expand_tilde(&source.path);
         match source.kind {
-            SourceKind::Projects => projects.extend(scan::scan_projects(&root)?),
-            SourceKind::Notes => all_notes.extend(scan::scan_notes(&root)?),
+            SourceKind::Projects => {
+                projects.extend(scan::scan_projects(&root).with_context(|| {
+                    format!("failed to scan configured source {}", root.display())
+                })?)
+            }
+            SourceKind::Notes => {
+                all_notes.extend(scan::scan_notes(&root).with_context(|| {
+                    format!("failed to scan configured source {}", root.display())
+                })?)
+            }
         }
     }
 

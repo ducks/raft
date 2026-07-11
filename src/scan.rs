@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,10 +24,8 @@ pub fn scan_notes(root: &Path) -> Result<Vec<NoteFile>> {
     let mut notes = Vec::new();
 
     for entry in WalkDir::new(root).follow_links(false) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry =
+            entry.with_context(|| format!("could not walk notes source {}", root.display()))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -35,10 +33,8 @@ pub fn scan_notes(root: &Path) -> Result<Vec<NoteFile>> {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let body = match std::fs::read_to_string(path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("could not read note {}", path.display()))?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let note_date = parse_date_stem(stem);
         let mtime_date = entry
@@ -80,12 +76,13 @@ fn parse_date_stem(stem: &str) -> Option<String> {
 pub fn scan_projects(root: &Path) -> Result<Vec<Project>> {
     let mut projects = Vec::new();
 
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(_) => return Ok(projects),
-    };
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("could not read projects source {}", root.display()))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!("could not read entry in projects source {}", root.display())
+        })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -151,11 +148,25 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn error_message<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected scan to fail"),
+            Err(err) => err.to_string(),
+        }
+    }
 
     #[test]
     fn parse_date_stem_accepts_iso_dates() {
-        assert_eq!(parse_date_stem("2026-07-10"), Some("2026-07-10".to_string()));
-        assert_eq!(parse_date_stem("1999-01-01"), Some("1999-01-01".to_string()));
+        assert_eq!(
+            parse_date_stem("2026-07-10"),
+            Some("2026-07-10".to_string())
+        );
+        assert_eq!(
+            parse_date_stem("1999-01-01"),
+            Some("1999-01-01".to_string())
+        );
     }
 
     #[test]
@@ -173,5 +184,39 @@ mod tests {
         // Right shape, but letters where digits belong.
         assert_eq!(parse_date_stem("20xx-07-10"), None);
         assert_eq!(parse_date_stem("2026-ab-10"), None);
+    }
+
+    #[test]
+    fn missing_notes_source_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+
+        let err = error_message(scan_notes(&missing));
+
+        assert!(err.contains("could not walk notes source"), "{err}");
+        assert!(err.contains(missing.to_str().unwrap()), "{err}");
+    }
+
+    #[test]
+    fn unreadable_note_content_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let note = dir.path().join("invalid.md");
+        std::fs::write(&note, [0xff, 0xfe]).unwrap();
+
+        let err = error_message(scan_notes(dir.path()));
+
+        assert!(err.contains("could not read note"), "{err}");
+        assert!(err.contains(note.to_str().unwrap()), "{err}");
+    }
+
+    #[test]
+    fn missing_projects_source_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+
+        let err = error_message(scan_projects(&missing));
+
+        assert!(err.contains("could not read projects source"), "{err}");
+        assert!(err.contains(missing.to_str().unwrap()), "{err}");
     }
 }
