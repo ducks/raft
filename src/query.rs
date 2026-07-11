@@ -10,52 +10,57 @@ pub struct SearchHit {
 }
 
 pub fn search(conn: &Connection, term: &str, limit: usize) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", term.to_lowercase());
+    let Some(match_query) = fts_query(term) else {
+        // Term had no indexable tokens (all punctuation/whitespace).
+        return Ok(Vec::new());
+    };
+
+    // bm25() ranks by relevance (lower is better in SQLite's signed form,
+    // so ORDER BY ascending). snippet() returns a windowed excerpt with the
+    // matched terms bracketed, collapsing the hand-rolled snippet logic.
     let mut stmt = conn.prepare(
-        "SELECT nodes.path, notes.note_date, notes.body
-         FROM notes JOIN nodes ON nodes.id = notes.node_id
-         WHERE lower(notes.body) LIKE ?1
-         ORDER BY notes.note_date DESC NULLS LAST
+        "SELECT nodes.path, notes.note_date,
+                snippet(notes_fts, 0, '', '', ' ... ', 12)
+         FROM notes_fts
+         JOIN notes ON notes.node_id = notes_fts.rowid
+         JOIN nodes ON nodes.id = notes.node_id
+         WHERE notes_fts MATCH ?1
+         ORDER BY bm25(notes_fts)
          LIMIT ?2",
     )?;
 
-    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-        let path: String = row.get(0)?;
-        let note_date: Option<String> = row.get(1)?;
-        let body: String = row.get(2)?;
-        Ok((path, note_date, body))
+    let rows = stmt.query_map(params![match_query, limit as i64], |row| {
+        Ok(SearchHit {
+            path: row.get(0)?,
+            note_date: row.get(1)?,
+            snippet: normalize_snippet(&row.get::<_, String>(2)?),
+        })
     })?;
 
-    let term_lower = term.to_lowercase();
-    let mut hits = Vec::new();
-    for row in rows {
-        let (path, note_date, body) = row?;
-        hits.push(SearchHit {
-            path,
-            note_date,
-            snippet: snippet_around(&body, &term_lower),
-        });
-    }
-    Ok(hits)
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-fn snippet_around(body: &str, term_lower: &str) -> String {
-    let lower = body.to_lowercase();
-    let Some(pos) = lower.find(term_lower) else {
-        return String::new();
-    };
-    let start = body[..pos]
-        .char_indices()
-        .rev()
-        .nth(60)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let end = body[pos..]
-        .char_indices()
-        .nth(term_lower.len() + 60)
-        .map(|(i, _)| pos + i)
-        .unwrap_or(body.len());
-    body[start..end].replace('\n', " ").trim().to_string()
+/// Turn a raw user term into a safe FTS5 MATCH query. Splits on anything
+/// that isn't alphanumeric and quotes each token as a phrase, so
+/// punctuation-heavy input (`c++`, `foo-bar`, stray quotes) can't produce
+/// an FTS syntax error. Multiple tokens become an AND of quoted phrases.
+/// Returns None when nothing indexable remains.
+fn fts_query(term: &str) -> Option<String> {
+    let tokens: Vec<String> = term
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
+/// Collapse whitespace/newlines in an FTS snippet to a single line.
+fn normalize_snippet(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Serialize)]
@@ -368,4 +373,117 @@ pub fn connect(conn: &Connection, min_shared: i64, limit: usize) -> Result<Conne
         co_mentions,
         temporal,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::open_in_memory;
+
+    /// Insert a note node + body, then refresh the FTS index.
+    fn add_note(conn: &Connection, path: &str, date: Option<&str>, body: &str) {
+        conn.execute(
+            "INSERT INTO nodes (kind, name, path, meta) VALUES ('note', ?1, ?1, '{}')",
+            params![path],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO notes (node_id, body, note_date, mtime) VALUES (?1, ?2, ?3, NULL)",
+            params![id, body, date],
+        )
+        .unwrap();
+    }
+
+    fn rebuild_fts(conn: &Connection) {
+        conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn fts_query_quotes_tokens_and_drops_punctuation() {
+        assert_eq!(fts_query("replaybook"), Some("\"replaybook\"".into()));
+        assert_eq!(fts_query("foo-bar"), Some("\"foo\" \"bar\"".into()));
+        assert_eq!(fts_query("c++"), Some("\"c\"".into()));
+        assert_eq!(fts_query("a \"quoted\" term"), Some("\"a\" \"quoted\" \"term\"".into()));
+    }
+
+    #[test]
+    fn fts_query_none_for_punctuation_only() {
+        assert_eq!(fts_query("+++"), None);
+        assert_eq!(fts_query("   "), None);
+        assert_eq!(fts_query(""), None);
+    }
+
+    #[test]
+    fn search_finds_matching_note() {
+        let conn = open_in_memory().unwrap();
+        add_note(&conn, "a.md", Some("2026-07-01"), "notes about replaybook today");
+        add_note(&conn, "b.md", Some("2026-07-02"), "unrelated grocery list");
+        rebuild_fts(&conn);
+
+        let hits = search(&conn, "replaybook", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+        assert!(hits[0].snippet.to_lowercase().contains("replaybook"));
+    }
+
+    #[test]
+    fn search_is_token_based_not_substring() {
+        // A LIKE '%cargo%' scan would match "cargofoo"; FTS tokenizes,
+        // so a bare word query must not.
+        let conn = open_in_memory().unwrap();
+        add_note(&conn, "a.md", None, "the cargofoo wrapper");
+        add_note(&conn, "b.md", None, "run cargo build");
+        rebuild_fts(&conn);
+
+        let hits = search(&conn, "cargo", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["b.md"]);
+    }
+
+    #[test]
+    fn search_ranks_by_relevance() {
+        let conn = open_in_memory().unwrap();
+        add_note(&conn, "dense.md", None, "raft raft raft raft everywhere");
+        add_note(&conn, "sparse.md", None, "one mention of raft among much other prose here");
+        rebuild_fts(&conn);
+
+        let hits = search(&conn, "raft", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        // bm25 favors the denser, shorter document.
+        assert_eq!(hits[0].path, "dense.md");
+    }
+
+    #[test]
+    fn search_multi_word_requires_all_terms() {
+        let conn = open_in_memory().unwrap();
+        add_note(&conn, "both.md", None, "the czechia visa paperwork");
+        add_note(&conn, "one.md", None, "the visa office was closed");
+        rebuild_fts(&conn);
+
+        let hits = search(&conn, "czechia visa", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["both.md"]);
+    }
+
+    #[test]
+    fn search_punctuation_only_term_returns_empty() {
+        let conn = open_in_memory().unwrap();
+        add_note(&conn, "a.md", None, "anything at all");
+        rebuild_fts(&conn);
+
+        assert!(search(&conn, "+++", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let conn = open_in_memory().unwrap();
+        for i in 0..5 {
+            add_note(&conn, &format!("n{i}.md"), None, "shared keyword here");
+        }
+        rebuild_fts(&conn);
+
+        assert_eq!(search(&conn, "keyword", 3).unwrap().len(), 3);
+    }
 }
