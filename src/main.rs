@@ -1,6 +1,7 @@
 mod config;
 mod extract;
 mod index;
+mod mcp;
 mod query;
 mod scan;
 
@@ -59,6 +60,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve the graph to agents as an MCP server over stdio
+    Serve,
     /// List configured sources
     Sources,
 }
@@ -165,6 +168,9 @@ fn main() -> Result<()> {
                     println!("no connections above the threshold (try --min 2)");
                 }
             }
+        }
+        Command::Serve => {
+            mcp::serve()?;
         }
         Command::Sources => {
             let cfg = config::Config::load()?;
