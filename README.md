@@ -28,3 +28,20 @@ Notes are the source of truth; the index (`~/.local/share/raft/raft.db`)
 is derived and disposable. Every edge carries provenance: `human`
 (you wrote the link), `indexer` (deterministic match), or `agent`
 (proposed by an LLM, with rationale).
+
+## Agents
+
+`raft serve` speaks MCP over stdio, exposing `search`, `about`,
+`dangling`, `connect`, and `reindex` as tools. Register it and any
+MCP-capable agent can walk your graph and refresh it after writing
+notes:
+
+```
+# Claude Code
+claude mcp add raft -- /path/to/raft serve
+
+# claux (config.toml)
+[mcp_servers.raft]
+command = "/path/to/raft"
+args = ["serve"]
+```
