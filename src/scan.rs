@@ -8,6 +8,8 @@ pub struct NoteFile {
     pub path: PathBuf,
     /// Date parsed from a YYYY-MM-DD filename, if the note is a daily note.
     pub note_date: Option<String>,
+    /// File mtime as YYYY-MM-DD, staleness fallback for undated notes.
+    pub mtime_date: Option<String>,
     pub body: String,
 }
 
@@ -39,10 +41,20 @@ pub fn scan_notes(root: &Path) -> Result<Vec<NoteFile>> {
         };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let note_date = parse_date_stem(stem);
+        let mtime_date = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                chrono::DateTime::<chrono::Local>::from(t)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            });
 
         notes.push(NoteFile {
             path: path.to_path_buf(),
             note_date,
+            mtime_date,
             body,
         });
     }
