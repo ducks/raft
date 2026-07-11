@@ -48,6 +48,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Connections nobody wrote down: co-mention affinity and
+    /// projects whose commits travel together
+    Connect {
+        /// Minimum shared notes / shared commit days for a pair
+        #[arg(long, default_value_t = 3)]
+        min: i64,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// List configured sources
     Sources,
 }
@@ -127,6 +138,32 @@ fn main() -> Result<()> {
                     );
                 }
                 println!("\n{} open loops", loops.len());
+            }
+        }
+        Command::Connect { min, limit, json } => {
+            let conn = index::open_db()?;
+            let connections = query::connect(&conn, min, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&connections)?);
+            } else {
+                if !connections.co_mentions.is_empty() {
+                    println!("keep showing up together:");
+                    for p in &connections.co_mentions {
+                        println!(
+                            "  {:.2}  {} ({}) <-> {} ({})  [{} notes over {} days]",
+                            p.score, p.a, p.a_kind, p.b, p.b_kind, p.shared_notes, p.span_days
+                        );
+                    }
+                }
+                if !connections.temporal.is_empty() {
+                    println!("\ncommits travel together:");
+                    for p in &connections.temporal {
+                        println!("  {:2} days  {} <-> {}", p.shared_days, p.a, p.b);
+                    }
+                }
+                if connections.co_mentions.is_empty() && connections.temporal.is_empty() {
+                    println!("no connections above the threshold (try --min 2)");
+                }
             }
         }
         Command::Sources => {
