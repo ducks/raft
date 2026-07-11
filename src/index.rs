@@ -3,7 +3,7 @@ use crate::extract;
 use crate::scan;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: i64 = 3;
@@ -194,16 +194,12 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         .map(|p| p.name.clone())
         .filter(|n| !ignore.contains(&extract::canonicalize(n)))
         .collect();
-    let project_canon: HashSet<String> = project_names
-        .iter()
-        .map(|n| extract::canonicalize(n))
-        .collect();
-
     let tx = conn.transaction()?;
     tx.execute_batch(
         "DELETE FROM notes_fts; DELETE FROM edges; DELETE FROM notes; DELETE FROM nodes;",
     )?;
 
+    let mut project_ids = HashMap::new();
     for project in &projects {
         let meta = project
             .git_meta
@@ -216,6 +212,14 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
             "INSERT OR IGNORE INTO nodes (kind, name, path, meta) VALUES ('project', ?1, ?2, ?3)",
             params![project.name, project.path.to_string_lossy(), meta],
         )?;
+        let project_id: i64 = tx.query_row(
+            "SELECT id FROM nodes WHERE kind = 'project' AND name = ?1",
+            params![project.name],
+            |row| row.get(0),
+        )?;
+        project_ids
+            .entry(extract::canonicalize(&project.name))
+            .or_insert(project_id);
     }
 
     let mut edge_count = 0usize;
@@ -236,11 +240,7 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         let extraction = extract::extract(&note.body, &project_names);
 
         for (project, count) in &extraction.project_mentions {
-            let dst: i64 = tx.query_row(
-                "SELECT id FROM nodes WHERE kind = 'project' AND name = ?1",
-                params![project],
-                |row| row.get(0),
-            )?;
+            let dst = project_ids[&extract::canonicalize(project)];
             // Confidence scales with how many times the name appears in prose.
             let rationale = format!("matched project name '{project}' {count}x in prose");
             insert_edge(
@@ -256,14 +256,14 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         }
 
         for target in &extraction.wiki_links {
-            let Some(dst) = upsert_entity(&tx, target, &ignore)? else {
+            let Some(target_node) = resolve_target(&tx, target, &ignore, &project_ids)? else {
                 continue;
             };
             let rationale = format!("wiki link [[{}]]", target.trim());
             insert_edge(
                 &tx,
                 note_id,
-                dst,
+                target_node.id,
                 "wikilink",
                 "human",
                 WEIGHT_WIKILINK,
@@ -275,18 +275,18 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         for span in &extraction.code_spans {
             // Spans matching a project name are already project mentions;
             // don't duplicate them as entities.
-            if project_canon.contains(&extract::canonicalize(span)) {
-                continue;
-            }
-            let Some(dst) = upsert_entity(&tx, span, &ignore)? else {
+            let Some(target_node) = resolve_target(&tx, span, &ignore, &project_ids)? else {
                 continue;
             };
+            if target_node.is_project {
+                continue;
+            }
             // Weakest signal: a backticked span that looked entity-shaped.
             let rationale = format!("backticked span `{}`", span.trim());
             insert_edge(
                 &tx,
                 note_id,
-                dst,
+                target_node.id,
                 "mentions",
                 "indexer",
                 WEIGHT_CODE_SPAN,
@@ -324,11 +324,7 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
             // `raft dangling --about <project>` can filter.
             let loop_extraction = extract::extract(&open_loop.text, &project_names);
             for project in loop_extraction.project_mentions.keys() {
-                let dst: i64 = tx.query_row(
-                    "SELECT id FROM nodes WHERE kind = 'project' AND name = ?1",
-                    params![project],
-                    |row| row.get(0),
-                )?;
+                let dst = project_ids[&extract::canonicalize(project)];
                 let rationale = format!("loop text mentions project '{project}'");
                 insert_edge(
                     &tx,
@@ -400,18 +396,32 @@ const STOPWORDS: &[&str] = &[
     "no", "n/a", "tbd", "todo", "done", "new", "old", "the", "and", "for", "not",
 ];
 
-/// Insert (or find) an entity under its canonical name. The first-seen
-/// spelling is kept as the display form. Returns None for names that
-/// canonicalize away to nothing, are too short, are stopwords, or are
-/// ignored.
-fn upsert_entity(
+struct TargetNode {
+    id: i64,
+    is_project: bool,
+}
+
+/// Resolve extracted text to one graph identity. Known projects take
+/// precedence over entities, regardless of case or edge punctuation. New
+/// entities use their canonical name for identity and retain the first-seen
+/// spelling in metadata for display.
+fn resolve_target(
     tx: &rusqlite::Transaction,
     raw: &str,
     ignore: &HashSet<String>,
-) -> Result<Option<i64>> {
+    project_ids: &HashMap<String, i64>,
+) -> Result<Option<TargetNode>> {
     let canonical = extract::canonicalize(raw);
-    if canonical.len() < 3 || ignore.contains(&canonical) || STOPWORDS.contains(&canonical.as_str())
-    {
+    if canonical.is_empty() || ignore.contains(&canonical) {
+        return Ok(None);
+    }
+    if let Some(id) = project_ids.get(&canonical) {
+        return Ok(Some(TargetNode {
+            id: *id,
+            is_project: true,
+        }));
+    }
+    if canonical.len() < 3 || STOPWORDS.contains(&canonical.as_str()) {
         return Ok(None);
     }
     let meta = serde_json::json!({ "display": raw.trim() }).to_string();
@@ -424,7 +434,10 @@ fn upsert_entity(
         params![canonical],
         |row| row.get(0),
     )?;
-    Ok(Some(id))
+    Ok(Some(TargetNode {
+        id,
+        is_project: false,
+    }))
 }
 
 /// How much to trust an inferred edge, and why. `weight` is a rough
@@ -594,5 +607,77 @@ mod tests {
 
         assert!(!temporary_path.exists());
         assert!(!live_path.exists());
+    }
+
+    #[test]
+    fn wiki_links_and_mentions_resolve_to_one_project_identity() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let projects = dir.path().join("projects");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(projects.join("Raft")).unwrap();
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(
+            notes.join("2026-07-11.md"),
+            "Worked on [[RAFT,]] today. Need to fix `raft`.",
+        )
+        .unwrap();
+        let config = Config {
+            sources: vec![
+                crate::config::Source {
+                    path: projects.to_string_lossy().into_owned(),
+                    kind: SourceKind::Projects,
+                },
+                crate::config::Source {
+                    path: notes.to_string_lossy().into_owned(),
+                    kind: SourceKind::Notes,
+                },
+            ],
+            ignore: Vec::new(),
+        };
+
+        let stats = rebuild_at(&config, &live_path).unwrap();
+        let conn = open_db_at(&live_path).unwrap();
+
+        assert_eq!(stats.projects, 1);
+        assert_eq!(stats.entities, 0);
+        let project_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE kind = 'project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_count, 1);
+
+        let about = crate::query::about(&conn, "raft,").unwrap().unwrap();
+        assert_eq!(about.kind, "project");
+        assert_eq!(about.notes.len(), 1);
+
+        let facts = crate::query::why(&conn, "RAFT,", 0.0).unwrap().unwrap();
+        assert!(facts.iter().any(|fact| fact.relation == "wikilink"));
+        assert!(facts.iter().any(|fact| fact.relation == "mentions"));
+    }
+
+    #[test]
+    fn canonical_wiki_link_variants_share_one_entity() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(notes.join("note.md"), "Compare [[NixOS,]] with [[nixos]].").unwrap();
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: notes.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
+
+        let stats = rebuild_at(&config, &live_path).unwrap();
+        let conn = open_db_at(&live_path).unwrap();
+
+        assert_eq!(stats.entities, 1);
+        assert!(crate::query::about(&conn, "NIXOS,").unwrap().is_some());
     }
 }

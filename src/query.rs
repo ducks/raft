@@ -1,3 +1,4 @@
+use crate::extract;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -85,21 +86,25 @@ pub struct CoMention {
     pub shared_notes: i64,
 }
 
+fn find_named_node(conn: &Connection, name: &str) -> Result<Option<(i64, String, String)>> {
+    let canonical = extract::canonicalize(name);
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, meta, name FROM nodes
+         WHERE kind IN ('project', 'entity')
+         ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END, id",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let stored_name: String = row.get(3)?;
+        if extract::canonicalize(&stored_name) == canonical {
+            return Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)));
+        }
+    }
+    Ok(None)
+}
+
 pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
-    let node: Option<(i64, String, String)> = conn
-        .query_row(
-            "SELECT id, kind, meta FROM nodes
-             WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
-             ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
-             LIMIT 1",
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
+    let node = find_named_node(conn, name)?;
 
     let Some((id, kind, meta)) = node else {
         return Ok(None);
@@ -114,7 +119,7 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
     };
 
     let mut stmt = conn.prepare(
-        "SELECT nodes.path, notes.note_date
+        "SELECT DISTINCT nodes.path, notes.note_date
          FROM edges
          JOIN nodes ON nodes.id = edges.src
          JOIN notes ON notes.node_id = edges.src
@@ -180,20 +185,7 @@ pub struct EdgeFact {
 /// wrote (ground truth). Returns None if the name is unknown, ordered
 /// strongest-evidence first. `min_weight` filters out weak edges.
 pub fn why(conn: &Connection, name: &str, min_weight: f64) -> Result<Option<Vec<EdgeFact>>> {
-    let target: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM nodes
-             WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
-             ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
-             LIMIT 1",
-            params![name],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
+    let target = find_named_node(conn, name)?.map(|node| node.0);
 
     let Some(target_id) = target else {
         return Ok(None);
@@ -238,20 +230,7 @@ pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<
     let about_id: Option<i64> = match about {
         None => None,
         Some(name) => {
-            let id = conn
-                .query_row(
-                    "SELECT id FROM nodes
-                     WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
-                     ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
-                     LIMIT 1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .map(Some)
-                .or_else(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    other => Err(other),
-                })?;
+            let id = find_named_node(conn, name)?.map(|node| node.0);
             match id {
                 Some(id) => Some(id),
                 None => return Ok(Vec::new()),
