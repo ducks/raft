@@ -143,6 +143,18 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "why",
+            "description": "Why a project or entity is in the graph: every edge pointing at it with provenance (human wiki link vs indexer heuristic), a confidence weight, and the rationale that created it. Use to audit whether a connection is trustworthy. Backticked-span mentions score 0.3; set min_weight to filter weak edges.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Project or entity name" },
+                    "min_weight": { "type": "number", "default": 0.0, "description": "Hide edges below this confidence weight" },
+                },
+                "required": ["name"],
+            },
+        },
+        {
             "name": "dangling",
             "description": "Open loops (follow-up items, unchecked boxes) across all notes, stalest first. Use to find forgotten work.",
             "inputSchema": {
@@ -198,6 +210,18 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
             let conn = index::open_db()?;
             match query::about(&conn, &name)? {
                 Some(about) => Ok(serde_json::to_string_pretty(&about)?),
+                None => Ok(format!("nothing known about '{name}'")),
+            }
+        }
+        "why" => {
+            let name = arg_str("name").ok_or_else(|| anyhow::anyhow!("missing 'name'"))?;
+            let min_weight = arguments
+                .get("min_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let conn = index::open_db()?;
+            match query::why(&conn, &name, min_weight)? {
+                Some(facts) => Ok(serde_json::to_string_pretty(&facts)?),
                 None => Ok(format!("nothing known about '{name}'")),
             }
         }

@@ -39,6 +39,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Why a project or entity is in the graph: every edge pointing at it,
+    /// with provenance, confidence, and the evidence that created it
+    Why {
+        name: String,
+        /// Hide edges below this confidence weight (backticked-span
+        /// mentions score 0.3; wiki links and dictionary hits score higher)
+        #[arg(long, default_value_t = 0.0)]
+        min_weight: f64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Open loops (follow-ups, unchecked boxes), stalest first
     Dangling {
         /// Only loops mentioning this project or entity
@@ -106,6 +117,33 @@ fn main() -> Result<()> {
                 None => println!("nothing known about '{name}' (try `raft index` first)"),
                 Some(about) if json => println!("{}", serde_json::to_string_pretty(&about)?),
                 Some(about) => print_about(&about),
+            }
+        }
+        Command::Why {
+            name,
+            min_weight,
+            json,
+        } => {
+            let conn = index::open_db()?;
+            match query::why(&conn, &name, min_weight)? {
+                None => println!("nothing known about '{name}' (try `raft index` first)"),
+                Some(facts) if json => println!("{}", serde_json::to_string_pretty(&facts)?),
+                Some(facts) if facts.is_empty() => {
+                    println!("no edges point at '{name}' above weight {min_weight}")
+                }
+                Some(facts) => {
+                    println!("{} ({} edges)", name, facts.len());
+                    for f in &facts {
+                        let src = shorten_source(&f.from, &f.from_kind);
+                        println!(
+                            "  {:.2}  {:<8} {:<9} {}",
+                            f.weight, f.provenance, f.relation, src
+                        );
+                        if let Some(r) = &f.rationale {
+                            println!("           {r}");
+                        }
+                    }
+                }
             }
         }
         Command::Dangling { about, limit, json } => {
@@ -185,6 +223,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Note sources are stored by full path; show just the filename. Other
+/// kinds (loop, entity) already carry a readable name.
+fn shorten_source(name: &str, kind: &str) -> String {
+    if kind == "note" {
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(name)
+            .to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 fn print_about(about: &query::About) {

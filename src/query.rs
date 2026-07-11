@@ -161,6 +161,67 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
     }))
 }
 
+/// One inbound edge to a target, with the evidence that produced it.
+#[derive(Debug, Serialize)]
+pub struct EdgeFact {
+    /// The node the edge comes from (a note path, or a loop/entity name).
+    pub from: String,
+    pub from_kind: String,
+    pub relation: String,
+    pub provenance: String,
+    pub weight: f64,
+    pub rationale: Option<String>,
+}
+
+/// Inspect why a target is in the graph: every edge pointing at it, with
+/// origin, confidence weight, and the rationale that created it. This makes
+/// inferred relationships auditable rather than opaque - you can see that a
+/// mention came from a backticked span (weak) versus a wiki link a human
+/// wrote (ground truth). Returns None if the name is unknown, ordered
+/// strongest-evidence first. `min_weight` filters out weak edges.
+pub fn why(conn: &Connection, name: &str, min_weight: f64) -> Result<Option<Vec<EdgeFact>>> {
+    let target: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM nodes
+             WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
+             ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
+             LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+
+    let Some(target_id) = target else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT src.name, src.kind, e.kind, e.provenance, e.weight, e.rationale
+         FROM edges e
+         JOIN nodes src ON src.id = e.src
+         WHERE e.dst = ?1 AND e.weight >= ?2
+         ORDER BY e.weight DESC, src.name",
+    )?;
+    let facts: Vec<EdgeFact> = stmt
+        .query_map(params![target_id, min_weight], |row| {
+            Ok(EdgeFact {
+                from: row.get(0)?,
+                from_kind: row.get(1)?,
+                relation: row.get(2)?,
+                provenance: row.get(3)?,
+                weight: row.get(4)?,
+                rationale: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    Ok(Some(facts))
+}
+
 #[derive(Debug, Serialize)]
 pub struct Dangling {
     pub text: String,
@@ -398,6 +459,84 @@ mod tests {
     fn rebuild_fts(conn: &Connection) {
         conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])
             .unwrap();
+    }
+
+    fn add_node(conn: &Connection, kind: &str, name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO nodes (kind, name, path, meta) VALUES (?1, ?2, NULL, '{}')",
+            params![kind, name],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_edge(
+        conn: &Connection,
+        src: i64,
+        dst: i64,
+        kind: &str,
+        provenance: &str,
+        weight: f64,
+        rationale: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO edges (src, dst, kind, provenance, weight, rationale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![src, dst, kind, provenance, weight, rationale],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn why_returns_edges_strongest_first_with_provenance() {
+        let conn = open_in_memory().unwrap();
+        let note = add_node(&conn, "note", "/n/2026-07-01.md");
+        let target = add_node(&conn, "entity", "nixos");
+        // A weak backticked-span edge and a strong dictionary-match edge.
+        add_edge(&conn, note, target, "mentions", "indexer", 0.3, "backticked span `nixos`");
+        let note2 = add_node(&conn, "note", "/n/2026-07-02.md");
+        add_edge(&conn, note2, target, "mentions", "indexer", 4.0, "matched project name 'nixos' 4x in prose");
+
+        let facts = why(&conn, "nixos", 0.0).unwrap().unwrap();
+        assert_eq!(facts.len(), 2);
+        // Strongest evidence first.
+        assert_eq!(facts[0].weight, 4.0);
+        assert_eq!(facts[1].weight, 0.3);
+        assert_eq!(facts[0].provenance, "indexer");
+        assert_eq!(
+            facts[0].rationale.as_deref(),
+            Some("matched project name 'nixos' 4x in prose")
+        );
+    }
+
+    #[test]
+    fn why_min_weight_filters_weak_edges() {
+        let conn = open_in_memory().unwrap();
+        let note = add_node(&conn, "note", "/n/a.md");
+        let target = add_node(&conn, "entity", "log");
+        add_edge(&conn, note, target, "mentions", "indexer", 0.3, "backticked span `log`");
+        let note2 = add_node(&conn, "note", "/n/b.md");
+        add_edge(&conn, note2, target, "mentions", "indexer", 2.0, "matched project name 'log' 2x in prose");
+
+        // Filtering above the weak span drops it.
+        let facts = why(&conn, "log", 1.0).unwrap().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].weight, 2.0);
+    }
+
+    #[test]
+    fn why_unknown_target_is_none() {
+        let conn = open_in_memory().unwrap();
+        assert!(why(&conn, "does-not-exist", 0.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn why_target_with_no_edges_is_empty_not_none() {
+        let conn = open_in_memory().unwrap();
+        add_node(&conn, "entity", "lonely");
+        let facts = why(&conn, "lonely", 0.0).unwrap();
+        assert_eq!(facts.unwrap().len(), 0);
     }
 
     #[test]

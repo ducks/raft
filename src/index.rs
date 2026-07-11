@@ -165,10 +165,16 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
                 params![project],
                 |row| row.get(0),
             )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO edges (src, dst, kind, provenance, weight)
-                 VALUES (?1, ?2, 'mentions', 'indexer', ?3)",
-                params![note_id, dst, *count as f64],
+            // Confidence scales with how many times the name appears in prose.
+            let rationale = format!("matched project name '{project}' {count}x in prose");
+            insert_edge(
+                &tx,
+                note_id,
+                dst,
+                "mentions",
+                "indexer",
+                *count as f64,
+                &rationale,
             )?;
             edge_count += 1;
         }
@@ -177,10 +183,15 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
             let Some(dst) = upsert_entity(&tx, target, &ignore)? else {
                 continue;
             };
-            tx.execute(
-                "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
-                 VALUES (?1, ?2, 'wikilink', 'human')",
-                params![note_id, dst],
+            let rationale = format!("wiki link [[{}]]", target.trim());
+            insert_edge(
+                &tx,
+                note_id,
+                dst,
+                "wikilink",
+                "human",
+                WEIGHT_WIKILINK,
+                &rationale,
             )?;
             edge_count += 1;
         }
@@ -194,10 +205,16 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
             let Some(dst) = upsert_entity(&tx, span, &ignore)? else {
                 continue;
             };
-            tx.execute(
-                "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
-                 VALUES (?1, ?2, 'mentions', 'indexer')",
-                params![note_id, dst],
+            // Weakest signal: a backticked span that looked entity-shaped.
+            let rationale = format!("backticked span `{}`", span.trim());
+            insert_edge(
+                &tx,
+                note_id,
+                dst,
+                "mentions",
+                "indexer",
+                WEIGHT_CODE_SPAN,
+                &rationale,
             )?;
             edge_count += 1;
         }
@@ -215,10 +232,14 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
                 params![open_loop.text],
                 |row| row.get(0),
             )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
-                 VALUES (?1, ?2, 'contains', 'indexer')",
-                params![note_id, loop_id],
+            insert_edge(
+                &tx,
+                note_id,
+                loop_id,
+                "contains",
+                "indexer",
+                WEIGHT_STRUCTURAL,
+                "open loop found in note",
             )?;
             loop_count += 1;
             edge_count += 1;
@@ -232,10 +253,15 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
                     params![project],
                     |row| row.get(0),
                 )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
-                     VALUES (?1, ?2, 'mentions', 'indexer')",
-                    params![loop_id, dst],
+                let rationale = format!("loop text mentions project '{project}'");
+                insert_edge(
+                    &tx,
+                    loop_id,
+                    dst,
+                    "mentions",
+                    "indexer",
+                    WEIGHT_STRUCTURAL,
+                    &rationale,
                 )?;
                 edge_count += 1;
             }
@@ -295,4 +321,33 @@ fn upsert_entity(
         |row| row.get(0),
     )?;
     Ok(Some(id))
+}
+
+/// How much to trust an inferred edge, and why. `weight` is a rough
+/// confidence signal (higher = stronger); `rationale` is the human-readable
+/// evidence that produced the edge. These let queries separate ground truth
+/// (wiki links a human wrote) from heuristic guesses (a backticked span that
+/// happened to look like an entity), instead of treating every edge alike.
+const WEIGHT_WIKILINK: f64 = 1.0; // human wrote the link
+const WEIGHT_CODE_SPAN: f64 = 0.3; // weakest: a backticked span, guessed
+const WEIGHT_STRUCTURAL: f64 = 1.0; // derived structure (loop containment)
+
+/// Insert an inferred/derived edge with its provenance filled in. Dedup is
+/// `INSERT OR IGNORE` on (src, dst, kind, provenance), so the first edge for
+/// a pair wins and its rationale is kept.
+fn insert_edge(
+    tx: &rusqlite::Transaction,
+    src: i64,
+    dst: i64,
+    kind: &str,
+    provenance: &str,
+    weight: f64,
+    rationale: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO edges (src, dst, kind, provenance, weight, rationale)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![src, dst, kind, provenance, weight, rationale],
+    )?;
+    Ok(())
 }
