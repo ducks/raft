@@ -4,6 +4,12 @@ A personal knowledge graph that grows out of what you already have:
 markdown notes, project repos, and git history. Named for what you call
 a group of ducks on water.
 
+Install the `raft` executable from crates.io:
+
+```
+cargo install raft-kg
+```
+
 Point it at directories, it builds the graph:
 
 ```toml
