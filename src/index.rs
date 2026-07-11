@@ -234,16 +234,25 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
     })
 }
 
+/// Common words that show up backticked (table headers, YAML keys,
+/// prose emphasis) but carry no identity.
+const STOPWORDS: &[&str] = &[
+    "what", "how", "why", "when", "where", "who", "true", "false", "nil", "null", "none", "yes",
+    "no", "n/a", "tbd", "todo", "done", "new", "old", "the", "and", "for", "not",
+];
+
 /// Insert (or find) an entity under its canonical name. The first-seen
 /// spelling is kept as the display form. Returns None for names that
-/// canonicalize away to nothing, are too short, or are ignored.
+/// canonicalize away to nothing, are too short, are stopwords, or are
+/// ignored.
 fn upsert_entity(
     tx: &rusqlite::Transaction,
     raw: &str,
     ignore: &HashSet<String>,
 ) -> Result<Option<i64>> {
     let canonical = extract::canonicalize(raw);
-    if canonical.len() < 3 || ignore.contains(&canonical) {
+    if canonical.len() < 3 || ignore.contains(&canonical) || STOPWORDS.contains(&canonical.as_str())
+    {
         return Ok(None);
     }
     let meta = serde_json::json!({ "display": raw.trim() }).to_string();
