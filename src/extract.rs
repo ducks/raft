@@ -349,7 +349,10 @@ mod tests {
 
     #[test]
     fn extract_ignores_project_mentions_in_fences() {
-        let e = extract("prose\n```\nreplaybook in code\n```\n", &names(&["replaybook"]));
+        let e = extract(
+            "prose\n```\nreplaybook in code\n```\n",
+            &names(&["replaybook"]),
+        );
         assert!(!e.project_mentions.contains_key("replaybook"));
     }
 
@@ -374,10 +377,19 @@ mod tests {
 
     #[test]
     fn loops_followup_header_variants_match() {
-        for header in ["## Follow-ups", "## TODO", "## Loose ends", "## Open questions"] {
+        for header in [
+            "## Follow-ups",
+            "## TODO",
+            "## Loose ends",
+            "## Open questions",
+        ] {
             let body = format!("{header}\n- an item\n");
             let loops = extract_loops(&body);
-            assert_eq!(loops.len(), 1, "header {header:?} should open a loop section");
+            assert_eq!(
+                loops.len(),
+                1,
+                "header {header:?} should open a loop section"
+            );
         }
     }
 

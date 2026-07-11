@@ -473,9 +473,25 @@ mod tests {
         let note = add_node(&conn, "note", "/n/2026-07-01.md");
         let target = add_node(&conn, "entity", "nixos");
         // A weak backticked-span edge and a strong dictionary-match edge.
-        add_edge(&conn, note, target, "mentions", "indexer", 0.3, "backticked span `nixos`");
+        add_edge(
+            &conn,
+            note,
+            target,
+            "mentions",
+            "indexer",
+            0.3,
+            "backticked span `nixos`",
+        );
         let note2 = add_node(&conn, "note", "/n/2026-07-02.md");
-        add_edge(&conn, note2, target, "mentions", "indexer", 4.0, "matched project name 'nixos' 4x in prose");
+        add_edge(
+            &conn,
+            note2,
+            target,
+            "mentions",
+            "indexer",
+            4.0,
+            "matched project name 'nixos' 4x in prose",
+        );
 
         let facts = why(&conn, "nixos", 0.0).unwrap().unwrap();
         assert_eq!(facts.len(), 2);
@@ -494,9 +510,25 @@ mod tests {
         let conn = open_in_memory().unwrap();
         let note = add_node(&conn, "note", "/n/a.md");
         let target = add_node(&conn, "entity", "log");
-        add_edge(&conn, note, target, "mentions", "indexer", 0.3, "backticked span `log`");
+        add_edge(
+            &conn,
+            note,
+            target,
+            "mentions",
+            "indexer",
+            0.3,
+            "backticked span `log`",
+        );
         let note2 = add_node(&conn, "note", "/n/b.md");
-        add_edge(&conn, note2, target, "mentions", "indexer", 2.0, "matched project name 'log' 2x in prose");
+        add_edge(
+            &conn,
+            note2,
+            target,
+            "mentions",
+            "indexer",
+            2.0,
+            "matched project name 'log' 2x in prose",
+        );
 
         // Filtering above the weak span drops it.
         let facts = why(&conn, "log", 1.0).unwrap().unwrap();
@@ -523,7 +555,10 @@ mod tests {
         assert_eq!(fts_query("replaybook"), Some("\"replaybook\"".into()));
         assert_eq!(fts_query("foo-bar"), Some("\"foo\" \"bar\"".into()));
         assert_eq!(fts_query("c++"), Some("\"c\"".into()));
-        assert_eq!(fts_query("a \"quoted\" term"), Some("\"a\" \"quoted\" \"term\"".into()));
+        assert_eq!(
+            fts_query("a \"quoted\" term"),
+            Some("\"a\" \"quoted\" \"term\"".into())
+        );
     }
 
     #[test]
@@ -536,7 +571,12 @@ mod tests {
     #[test]
     fn search_finds_matching_note() {
         let conn = open_in_memory().unwrap();
-        add_note(&conn, "a.md", Some("2026-07-01"), "notes about replaybook today");
+        add_note(
+            &conn,
+            "a.md",
+            Some("2026-07-01"),
+            "notes about replaybook today",
+        );
         add_note(&conn, "b.md", Some("2026-07-02"), "unrelated grocery list");
         rebuild_fts(&conn);
 
@@ -564,7 +604,12 @@ mod tests {
     fn search_ranks_by_relevance() {
         let conn = open_in_memory().unwrap();
         add_note(&conn, "dense.md", None, "raft raft raft raft everywhere");
-        add_note(&conn, "sparse.md", None, "one mention of raft among much other prose here");
+        add_note(
+            &conn,
+            "sparse.md",
+            None,
+            "one mention of raft among much other prose here",
+        );
         rebuild_fts(&conn);
 
         let hits = search(&conn, "raft", 10).unwrap();
