@@ -155,3 +155,89 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
         co_mentioned,
     }))
 }
+
+#[derive(Debug, Serialize)]
+pub struct Dangling {
+    pub text: String,
+    pub section: Option<String>,
+    pub first_seen: Option<String>,
+    pub age_days: Option<i64>,
+    pub sightings: i64,
+    pub note_path: String,
+}
+
+/// Open loops, stalest first. `about` filters to loops whose text
+/// mentions the given project or entity.
+pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<Vec<Dangling>> {
+    let about_id: Option<i64> = match about {
+        None => None,
+        Some(name) => {
+            let id = conn
+                .query_row(
+                    "SELECT id FROM nodes
+                     WHERE name = ?1 AND kind IN ('project', 'entity')
+                     ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
+                     LIMIT 1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })?;
+            match id {
+                Some(id) => Some(id),
+                None => return Ok(Vec::new()),
+            }
+        }
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT l.name, l.meta,
+                MIN(COALESCE(n.note_date, n.mtime)) AS first_seen,
+                COUNT(DISTINCT e.src) AS sightings,
+                MIN(src_node.path) AS note_path
+         FROM nodes l
+         JOIN edges e ON e.dst = l.id AND e.kind = 'contains'
+         JOIN notes n ON n.node_id = e.src
+         JOIN nodes src_node ON src_node.id = e.src
+         WHERE l.kind = 'loop'
+           AND (?1 IS NULL OR l.id IN
+                (SELECT src FROM edges WHERE dst = ?1 AND kind = 'mentions'))
+         GROUP BY l.id
+         ORDER BY first_seen ASC NULLS LAST
+         LIMIT ?2",
+    )?;
+
+    let today = chrono::Local::now().date_naive();
+    let rows = stmt.query_map(params![about_id, limit as i64], |row| {
+        let text: String = row.get(0)?;
+        let meta: String = row.get(1)?;
+        let first_seen: Option<String> = row.get(2)?;
+        let sightings: i64 = row.get(3)?;
+        let note_path: String = row.get(4)?;
+        Ok((text, meta, first_seen, sightings, note_path))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (text, meta, first_seen, sightings, note_path) = row?;
+        let section = serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|v| v.get("section").and_then(|s| s.as_str()).map(String::from));
+        let age_days = first_seen
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .map(|d| (today - d).num_days());
+        out.push(Dangling {
+            text,
+            section,
+            first_seen,
+            age_days,
+            sightings,
+            note_path,
+        });
+    }
+    Ok(out)
+}

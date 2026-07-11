@@ -94,3 +94,112 @@ fn strip_fences(body: &str) -> String {
     }
     out
 }
+
+/// An open loop: a checkbox or a bullet under a follow-up style header.
+#[derive(Debug)]
+pub struct Loop {
+    pub text: String,
+    /// The header the item was found under, if any.
+    pub section: Option<String>,
+}
+
+fn header_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap())
+}
+
+fn followup_header_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(follow.?ups?|next steps?|todos?|loose ends?|open (?:questions?|threads?|loops?)|\bnext\b)")
+            .unwrap()
+    })
+}
+
+fn checkbox_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+\[( |x|X)\]\s+(.+)$").unwrap())
+}
+
+fn bullet_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+(.+)$").unwrap())
+}
+
+/// Extract open loops from a note body. Unchecked checkboxes count
+/// anywhere; plain bullets count only under follow-up style headers.
+/// Checked boxes are done and skipped. Continuation lines (indented
+/// non-bullet text) are folded into the preceding item.
+pub fn extract_loops(body: &str) -> Vec<Loop> {
+    let mut loops: Vec<Loop> = Vec::new();
+    let mut current_header: Option<String> = None;
+    let mut in_followup_section = false;
+    let mut in_fence = false;
+    let mut open_item = false;
+
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            open_item = false;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if let Some(cap) = header_re().captures(line) {
+            let title = cap[2].trim().to_string();
+            in_followup_section = followup_header_re().is_match(&title);
+            current_header = Some(title);
+            open_item = false;
+            continue;
+        }
+
+        if let Some(cap) = checkbox_re().captures(line) {
+            open_item = false;
+            if &cap[1] == " " {
+                loops.push(Loop {
+                    text: cap[2].trim().to_string(),
+                    section: current_header.clone(),
+                });
+                open_item = true;
+            }
+            continue;
+        }
+
+        if in_followup_section {
+            if let Some(cap) = bullet_re().captures(line) {
+                loops.push(Loop {
+                    text: cap[1].trim().to_string(),
+                    section: current_header.clone(),
+                });
+                open_item = true;
+                continue;
+            }
+            // Fold indented continuation lines into the open item.
+            if open_item && line.starts_with("  ") && !line.trim().is_empty() {
+                if let Some(last) = loops.last_mut() {
+                    last.text.push(' ');
+                    last.text.push_str(line.trim());
+                }
+                continue;
+            }
+            open_item = false;
+        } else {
+            open_item = false;
+        }
+    }
+
+    // Items hand-marked as finished in prose still show up here;
+    // drop the common completion markers.
+    loops.retain(|l| {
+        let lower = l.text.to_lowercase();
+        !l.text.contains('✓')
+            && !l.text.contains("~~")
+            && !lower.contains("(completed)")
+            && !lower.contains("(done)")
+            && !lower.starts_with("done:")
+    });
+
+    loops
+}

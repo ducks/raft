@@ -38,6 +38,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Open loops (follow-ups, unchecked boxes), stalest first
+    Dangling {
+        /// Only loops mentioning this project or entity
+        #[arg(long)]
+        about: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// List configured sources
     Sources,
 }
@@ -55,8 +65,8 @@ fn main() -> Result<()> {
             let cfg = config::Config::load()?;
             let stats = index::rebuild(&cfg)?;
             println!(
-                "indexed {} notes, {} projects, {} entities, {} edges",
-                stats.notes, stats.projects, stats.entities, stats.edges
+                "indexed {} notes, {} projects, {} entities, {} loops, {} edges",
+                stats.notes, stats.projects, stats.entities, stats.loops, stats.edges
             );
         }
         Command::Search { term, limit, json } => {
@@ -82,6 +92,41 @@ fn main() -> Result<()> {
                 None => println!("nothing known about '{name}' (try `raft index` first)"),
                 Some(about) if json => println!("{}", serde_json::to_string_pretty(&about)?),
                 Some(about) => print_about(&about),
+            }
+        }
+        Command::Dangling { about, limit, json } => {
+            let conn = index::open_db()?;
+            let loops = query::dangling(&conn, about.as_deref(), limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&loops)?);
+            } else if loops.is_empty() {
+                println!("no open loops found");
+            } else {
+                for l in &loops {
+                    let age = l
+                        .age_days
+                        .map(|d| format!("{d}d"))
+                        .unwrap_or_else(|| "?".into());
+                    let text: String = if l.text.chars().count() > 110 {
+                        let truncated: String = l.text.chars().take(107).collect();
+                        format!("{truncated}...")
+                    } else {
+                        l.text.clone()
+                    };
+                    println!("{age:>5}  {text}");
+                    let seen = if l.sightings > 1 {
+                        format!("  (seen {}x)", l.sightings)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "       {}  {}{}",
+                        l.first_seen.as_deref().unwrap_or(""),
+                        l.note_path,
+                        seen
+                    );
+                }
+                println!("\n{} open loops", loops.len());
             }
         }
         Command::Sources => {

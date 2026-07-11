@@ -5,10 +5,12 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
+const SCHEMA_VERSION: i64 = 2;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
     id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,             -- note | project | entity
+    kind TEXT NOT NULL,             -- note | project | entity | loop
     name TEXT NOT NULL,
     path TEXT,
     meta TEXT,                      -- JSON blob, kind-specific
@@ -18,7 +20,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS notes (
     node_id INTEGER PRIMARY KEY REFERENCES nodes(id),
     body TEXT NOT NULL,
-    note_date TEXT                  -- YYYY-MM-DD for daily notes
+    note_date TEXT,                 -- YYYY-MM-DD for daily notes
+    mtime TEXT                      -- YYYY-MM-DD file mtime fallback
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -43,7 +46,16 @@ pub fn open_db() -> Result<Connection> {
     }
     let conn = Connection::open(&path)
         .with_context(|| format!("could not open database at {}", path.display()))?;
+
+    // The index is derived data; on schema changes just start over.
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS nodes;",
+        )?;
+    }
     conn.execute_batch(SCHEMA)?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(conn)
 }
 
@@ -52,6 +64,7 @@ pub struct IndexStats {
     pub projects: usize,
     pub entities: usize,
     pub edges: usize,
+    pub loops: usize,
 }
 
 /// Full rebuild: scan every source, replace the index.
@@ -91,6 +104,7 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
 
     let mut entity_count = 0usize;
     let mut edge_count = 0usize;
+    let mut loop_count = 0usize;
 
     for note in &all_notes {
         let name = note.path.to_string_lossy().to_string();
@@ -100,8 +114,8 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         )?;
         let note_id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO notes (node_id, body, note_date) VALUES (?1, ?2, ?3)",
-            params![note_id, note.body, note.note_date],
+            "INSERT INTO notes (node_id, body, note_date, mtime) VALUES (?1, ?2, ?3, ?4)",
+            params![note_id, note.body, note.note_date, note.mtime_date],
         )?;
 
         let extraction = extract::extract(&note.body, &project_names);
@@ -145,6 +159,45 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
             )?;
             edge_count += 1;
         }
+
+        for open_loop in extract::extract_loops(&note.body) {
+            let meta = serde_json::json!({ "section": open_loop.section }).to_string();
+            // Identical text across notes intentionally merges into one
+            // loop node; multiple 'contains' edges record every sighting.
+            tx.execute(
+                "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('loop', ?1, ?2)",
+                params![open_loop.text, meta],
+            )?;
+            let loop_id: i64 = tx.query_row(
+                "SELECT id FROM nodes WHERE kind = 'loop' AND name = ?1",
+                params![open_loop.text],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
+                 VALUES (?1, ?2, 'contains', 'indexer')",
+                params![note_id, loop_id],
+            )?;
+            loop_count += 1;
+            edge_count += 1;
+
+            // Link the loop to the projects its text mentions so
+            // `raft dangling --about <project>` can filter.
+            let loop_extraction = extract::extract(&open_loop.text, &project_names);
+            for project in loop_extraction.project_mentions.keys() {
+                let dst: i64 = tx.query_row(
+                    "SELECT id FROM nodes WHERE kind = 'project' AND name = ?1",
+                    params![project],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
+                     VALUES (?1, ?2, 'mentions', 'indexer')",
+                    params![loop_id, dst],
+                )?;
+                edge_count += 1;
+            }
+        }
     }
 
     tx.commit()?;
@@ -154,6 +207,7 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         projects: projects.len(),
         entities: entity_count,
         edges: edge_count,
+        loops: loop_count,
     })
 }
 
