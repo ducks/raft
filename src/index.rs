@@ -58,15 +58,55 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open the index for reading. Never mutates the schema: if the database
+/// is missing or was built by an older raft (stale schema version), this
+/// returns an error telling the user to reindex rather than silently
+/// wiping the index and returning empty results. Only `rebuild` is allowed
+/// to reset the index (see `open_db_for_rebuild`).
 pub fn open_db() -> Result<Connection> {
-    let path = crate::config::db_path()?;
+    open_db_at(&crate::config::db_path()?)
+}
+
+/// Open the index for reading at a specific path. Never mutates the schema:
+/// if the database is missing or was built by an older raft (stale schema
+/// version), returns an error telling the user to reindex rather than
+/// silently wiping the index and returning empty results. Only `rebuild` is
+/// allowed to reset the index (see `open_db_for_rebuild_at`).
+fn open_db_at(path: &std::path::Path) -> Result<Connection> {
+    if !path.exists() {
+        anyhow::bail!("no index at {} - run `raft index` first", path.display());
+    }
+    let conn = Connection::open(path)
+        .with_context(|| format!("could not open database at {}", path.display()))?;
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        anyhow::bail!(
+            "index at {} was built by a different raft version \
+             (schema {version}, expected {SCHEMA_VERSION}) - run `raft index` to rebuild it",
+            path.display()
+        );
+    }
+    Ok(conn)
+}
+
+fn open_db_for_rebuild() -> Result<Connection> {
+    open_db_for_rebuild_at(&crate::config::db_path()?)
+}
+
+/// Open (creating if needed) the index for a full rebuild at a specific
+/// path. This is the only path allowed to drop tables: on a stale schema
+/// version it resets the index, since the index is derived data that
+/// `rebuild` is about to repopulate. Read commands use `open_db`, which
+/// never does this.
+fn open_db_for_rebuild_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(&path)
+    let conn = Connection::open(path)
         .with_context(|| format!("could not open database at {}", path.display()))?;
 
-    // The index is derived data; on schema changes just start over.
+    // The index is derived data; on a schema change just start over.
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
         conn.execute_batch(
@@ -91,7 +131,7 @@ pub struct IndexStats {
 
 /// Full rebuild: scan every source, replace the index.
 pub fn rebuild(config: &Config) -> Result<IndexStats> {
-    let mut conn = open_db()?;
+    let mut conn = open_db_for_rebuild()?;
 
     // Scan projects first so notes can be matched against the dictionary.
     let mut projects = Vec::new();
@@ -350,4 +390,84 @@ fn insert_edge(
         params![src, dst, kind, provenance, weight, rationale],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn seed_index(path: &std::path::Path) {
+        // Build a current-schema index with one node so we can tell whether
+        // a later open wiped it.
+        let conn = open_db_for_rebuild_at(path).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (kind, name, path, meta) VALUES ('project', 'canary', NULL, '{}')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn node_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn read_on_missing_db_errors_instead_of_creating_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("raft.db");
+        let err = open_db_at(&path).unwrap_err().to_string();
+        assert!(err.contains("no index"), "unexpected error: {err}");
+        // Must not have created the file as a side effect.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_after_rebuild_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("raft.db");
+        seed_index(&path);
+        let conn = open_db_at(&path).unwrap();
+        assert_eq!(node_count(&conn), 1);
+    }
+
+    #[test]
+    fn read_on_stale_schema_errors_and_does_not_wipe() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("raft.db");
+        seed_index(&path);
+
+        // Simulate an index left by an older raft.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .unwrap();
+        }
+
+        let err = open_db_at(&path).unwrap_err().to_string();
+        assert!(err.contains("different raft version"), "unexpected: {err}");
+
+        // The data must survive - a read must never destroy the index.
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(node_count(&conn), 1);
+    }
+
+    #[test]
+    fn rebuild_resets_stale_schema_then_read_works() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("raft.db");
+        seed_index(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .unwrap();
+        }
+
+        // Rebuild is allowed to reset; it upgrades the schema version.
+        let _ = open_db_for_rebuild_at(&path).unwrap();
+        let conn = open_db_at(&path).unwrap();
+        // The stale table was dropped and recreated empty by rebuild.
+        assert_eq!(node_count(&conn), 0);
+    }
 }
