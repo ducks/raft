@@ -79,6 +79,13 @@ fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+/// Canonical form for entity identity: lowercase, edge punctuation
+/// trimmed. `Jolteon`, `jolteon` and `jolteon,` are one entity.
+pub fn canonicalize(name: &str) -> String {
+    name.trim_matches(|c: char| c.is_whitespace() || ".,:;!?'\"()[]{}".contains(c))
+        .to_lowercase()
+}
+
 fn strip_fences(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut in_fence = false;

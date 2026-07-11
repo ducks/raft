@@ -6,6 +6,10 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     pub sources: Vec<Source>,
+    /// Names that never become entities or project mentions
+    /// (compared canonically, so case-insensitive).
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

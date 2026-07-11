@@ -84,7 +84,7 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
     let node: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, kind, meta FROM nodes
-             WHERE name = ?1 AND kind IN ('project', 'entity')
+             WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
              ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
              LIMIT 1",
             params![name],
@@ -175,7 +175,7 @@ pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<
             let id = conn
                 .query_row(
                     "SELECT id FROM nodes
-                     WHERE name = ?1 AND kind IN ('project', 'entity')
+                     WHERE lower(name) = lower(?1) AND kind IN ('project', 'entity')
                      ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END
                      LIMIT 1",
                     params![name],

@@ -83,7 +83,23 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         }
     }
 
-    let project_names: HashSet<String> = projects.iter().map(|p| p.name.clone()).collect();
+    let ignore: HashSet<String> = config
+        .ignore
+        .iter()
+        .map(|s| extract::canonicalize(s))
+        .collect();
+
+    // Ignored names never enter the matching dictionary; the project
+    // node itself still exists, it just never gets auto-linked.
+    let project_names: HashSet<String> = projects
+        .iter()
+        .map(|p| p.name.clone())
+        .filter(|n| !ignore.contains(&extract::canonicalize(n)))
+        .collect();
+    let project_canon: HashSet<String> = project_names
+        .iter()
+        .map(|n| extract::canonicalize(n))
+        .collect();
 
     let tx = conn.transaction()?;
     tx.execute_batch("DELETE FROM edges; DELETE FROM notes; DELETE FROM nodes;")?;
@@ -102,7 +118,6 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         )?;
     }
 
-    let mut entity_count = 0usize;
     let mut edge_count = 0usize;
     let mut loop_count = 0usize;
 
@@ -135,7 +150,9 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         }
 
         for target in &extraction.wiki_links {
-            let dst = upsert_entity(&tx, target)?;
+            let Some(dst) = upsert_entity(&tx, target, &ignore)? else {
+                continue;
+            };
             tx.execute(
                 "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
                  VALUES (?1, ?2, 'wikilink', 'human')",
@@ -145,13 +162,14 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         }
 
         for span in &extraction.code_spans {
-            // Only spans that recur across the corpus become entities;
-            // for v0 store them all and let queries filter by degree.
-            if span.len() < 3 || project_names.contains(span) {
+            // Spans matching a project name are already project mentions;
+            // don't duplicate them as entities.
+            if project_canon.contains(&extract::canonicalize(span)) {
                 continue;
             }
-            let dst = upsert_entity(&tx, span)?;
-            entity_count += 1;
+            let Some(dst) = upsert_entity(&tx, span, &ignore)? else {
+                continue;
+            };
             tx.execute(
                 "INSERT OR IGNORE INTO edges (src, dst, kind, provenance)
                  VALUES (?1, ?2, 'mentions', 'indexer')",
@@ -200,26 +218,43 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         }
     }
 
+    let entity_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE kind = 'entity'",
+        [],
+        |row| row.get(0),
+    )?;
     tx.commit()?;
 
     Ok(IndexStats {
         notes: all_notes.len(),
         projects: projects.len(),
-        entities: entity_count,
+        entities: entity_count as usize,
         edges: edge_count,
         loops: loop_count,
     })
 }
 
-fn upsert_entity(tx: &rusqlite::Transaction, name: &str) -> Result<i64> {
+/// Insert (or find) an entity under its canonical name. The first-seen
+/// spelling is kept as the display form. Returns None for names that
+/// canonicalize away to nothing, are too short, or are ignored.
+fn upsert_entity(
+    tx: &rusqlite::Transaction,
+    raw: &str,
+    ignore: &HashSet<String>,
+) -> Result<Option<i64>> {
+    let canonical = extract::canonicalize(raw);
+    if canonical.len() < 3 || ignore.contains(&canonical) {
+        return Ok(None);
+    }
+    let meta = serde_json::json!({ "display": raw.trim() }).to_string();
     tx.execute(
-        "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('entity', ?1, '{}')",
-        params![name],
+        "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('entity', ?1, ?2)",
+        params![canonical, meta],
     )?;
     let id = tx.query_row(
         "SELECT id FROM nodes WHERE kind = 'entity' AND name = ?1",
-        params![name],
+        params![canonical],
         |row| row.get(0),
     )?;
-    Ok(id)
+    Ok(Some(id))
 }
