@@ -4,6 +4,7 @@ use crate::scan;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: i64 = 3;
 
@@ -62,7 +63,7 @@ pub fn open_in_memory() -> Result<Connection> {
 /// is missing or was built by an older raft (stale schema version), this
 /// returns an error telling the user to reindex rather than silently
 /// wiping the index and returning empty results. Only `rebuild` is allowed
-/// to reset the index (see `open_db_for_rebuild`).
+/// to replace the index (see `rebuild`).
 pub fn open_db() -> Result<Connection> {
     open_db_at(&crate::config::db_path()?)
 }
@@ -71,7 +72,7 @@ pub fn open_db() -> Result<Connection> {
 /// if the database is missing or was built by an older raft (stale schema
 /// version), returns an error telling the user to reindex rather than
 /// silently wiping the index and returning empty results. Only `rebuild` is
-/// allowed to reset the index (see `open_db_for_rebuild_at`).
+/// allowed to replace the index (see `rebuild_at`).
 fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     if !path.exists() {
         anyhow::bail!("no index at {} - run `raft index` first", path.display());
@@ -90,35 +91,57 @@ fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn open_db_for_rebuild() -> Result<Connection> {
-    open_db_for_rebuild_at(&crate::config::db_path()?)
-}
-
-/// Open (creating if needed) the index for a full rebuild at a specific
-/// path. This is the only path allowed to drop tables: on a stale schema
-/// version it resets the index, since the index is derived data that
-/// `rebuild` is about to repopulate. Read commands use `open_db`, which
-/// never does this.
-fn open_db_for_rebuild_at(path: &std::path::Path) -> Result<Connection> {
+/// Create a brand-new database with the current schema. Rebuilds only call
+/// this for a temporary path; the live index is never modified in place.
+fn create_db_at(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("could not remove stale index at {}", path.display()))?;
+    }
     let conn = Connection::open(path)
         .with_context(|| format!("could not open database at {}", path.display()))?;
-
-    // The index is derived data; on a schema change just start over.
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version < SCHEMA_VERSION {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS notes_fts;
-             DROP TABLE IF EXISTS edges;
-             DROP TABLE IF EXISTS notes;
-             DROP TABLE IF EXISTS nodes;",
-        )?;
-    }
     conn.execute_batch(SCHEMA)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(conn)
+}
+
+struct TemporaryIndex {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TemporaryIndex {
+    fn beside(live_path: &Path) -> Result<Self> {
+        let file_name = live_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("database path has no UTF-8 filename")?;
+        let path = live_path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+        Ok(Self { path, keep: false })
+    }
+
+    fn install(mut self, live_path: &Path) -> Result<()> {
+        std::fs::rename(&self.path, live_path).with_context(|| {
+            format!(
+                "could not replace index {} with completed rebuild {}",
+                live_path.display(),
+                self.path.display()
+            )
+        })?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub struct IndexStats {
@@ -131,8 +154,10 @@ pub struct IndexStats {
 
 /// Full rebuild: scan every source, replace the index.
 pub fn rebuild(config: &Config) -> Result<IndexStats> {
-    let mut conn = open_db_for_rebuild()?;
+    rebuild_at(config, &crate::config::db_path()?)
+}
 
+fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     // Scan projects first so notes can be matched against the dictionary.
     let mut projects = Vec::new();
     let mut all_notes = Vec::new();
@@ -152,6 +177,9 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
             }
         }
     }
+
+    let temporary = TemporaryIndex::beside(live_path)?;
+    let mut conn = create_db_at(&temporary.path)?;
 
     let ignore: HashSet<String> = config
         .ignore
@@ -328,13 +356,41 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
 
     tx.commit()?;
 
-    Ok(IndexStats {
+    let stats = IndexStats {
         notes: all_notes.len(),
         projects: projects.len(),
         entities: entity_count as usize,
         edges: edge_count,
         loops: loop_count,
-    })
+    };
+
+    validate_index(&conn)?;
+    drop(conn);
+    temporary.install(live_path)?;
+
+    Ok(stats)
+}
+
+fn validate_index(conn: &Connection) -> Result<()> {
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        anyhow::bail!("rebuilt index failed integrity check: {integrity}");
+    }
+
+    // With an external-content FTS5 table, SELECT COUNT(*) reads through
+    // `notes` and cannot detect a stale search index. rank=1 makes FTS5's
+    // integrity command compare the index against that content table.
+    conn.execute(
+        "INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .context("rebuilt index failed FTS integrity check")?;
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        anyhow::bail!("rebuilt index has schema version {version}, expected {SCHEMA_VERSION}");
+    }
+    Ok(())
 }
 
 /// Common words that show up backticked (table headers, YAML keys,
@@ -408,7 +464,7 @@ mod tests {
     fn seed_index(path: &std::path::Path) {
         // Build a current-schema index with one node so we can tell whether
         // a later open wiped it.
-        let conn = open_db_for_rebuild_at(path).unwrap();
+        let conn = create_db_at(path).unwrap();
         conn.execute(
             "INSERT INTO nodes (kind, name, path, meta) VALUES ('project', 'canary', NULL, '{}')",
             [],
@@ -462,20 +518,81 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_resets_stale_schema_then_read_works() {
+    fn atomic_rebuild_replaces_the_live_index() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("raft.db");
         seed_index(&path);
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-                .unwrap();
-        }
+        let notes = dir.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(notes.join("2026-07-11.md"), "working on [[Raft]]").unwrap();
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: notes.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
 
-        // Rebuild is allowed to reset; it upgrades the schema version.
-        let _ = open_db_for_rebuild_at(&path).unwrap();
+        let stats = rebuild_at(&config, &path).unwrap();
+
+        assert_eq!(stats.notes, 1);
         let conn = open_db_at(&path).unwrap();
-        // The stale table was dropped and recreated empty by rebuild.
-        assert_eq!(node_count(&conn), 0);
+        assert_eq!(node_count(&conn), 2);
+        validate_index(&conn).unwrap();
+    }
+
+    #[test]
+    fn failed_scan_preserves_the_live_index() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("raft.db");
+        seed_index(&path);
+        let missing = dir.path().join("missing-notes");
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: missing.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
+
+        assert!(rebuild_at(&config, &path).is_err());
+
+        let conn = open_db_at(&path).unwrap();
+        assert_eq!(node_count(&conn), 1);
+        let canary: String = conn
+            .query_row("SELECT name FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(canary, "canary");
+    }
+
+    #[test]
+    fn temporary_index_is_removed_when_validation_fails() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let temporary = TemporaryIndex::beside(&live_path).unwrap();
+        let temporary_path = temporary.path.clone();
+        let conn = create_db_at(&temporary_path).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (kind, name, path, meta) VALUES ('note', 'n.md', 'n.md', '{}')",
+            [],
+        )
+        .unwrap();
+        let note_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO notes (node_id, body) VALUES (?1, 'indexed text')",
+            params![note_id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])
+            .unwrap();
+        conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('delete-all')", [])
+            .unwrap();
+
+        assert!(validate_index(&conn).is_err());
+        drop(conn);
+        drop(temporary);
+
+        assert!(!temporary_path.exists());
+        assert!(!live_path.exists());
     }
 }
