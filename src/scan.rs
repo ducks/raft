@@ -147,3 +147,31 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_date_stem_accepts_iso_dates() {
+        assert_eq!(parse_date_stem("2026-07-10"), Some("2026-07-10".to_string()));
+        assert_eq!(parse_date_stem("1999-01-01"), Some("1999-01-01".to_string()));
+    }
+
+    #[test]
+    fn parse_date_stem_rejects_wrong_shape() {
+        // Wrong length, wrong separators, or non-daily filenames.
+        assert_eq!(parse_date_stem("2026-7-10"), None); // not zero-padded
+        assert_eq!(parse_date_stem("2026/07/10"), None); // wrong separator
+        assert_eq!(parse_date_stem("notes"), None);
+        assert_eq!(parse_date_stem("2026-07-10-notes"), None);
+        assert_eq!(parse_date_stem(""), None);
+    }
+
+    #[test]
+    fn parse_date_stem_rejects_non_digits_in_date_slots() {
+        // Right shape, but letters where digits belong.
+        assert_eq!(parse_date_stem("20xx-07-10"), None);
+        assert_eq!(parse_date_stem("2026-ab-10"), None);
+    }
+}

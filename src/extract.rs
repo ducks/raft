@@ -210,3 +210,207 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
 
     loops
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- canonicalize -----------------------------------------------------
+
+    #[test]
+    fn canonicalize_lowercases_and_trims_edge_punctuation() {
+        assert_eq!(canonicalize("Jolteon"), "jolteon");
+        assert_eq!(canonicalize("jolteon,"), "jolteon");
+        assert_eq!(canonicalize("  (Replaybook)  "), "replaybook");
+        assert_eq!(canonicalize("\"quoted\""), "quoted");
+    }
+
+    #[test]
+    fn canonicalize_keeps_interior_punctuation() {
+        // Only edge punctuation is trimmed; interior dots/slashes stay.
+        assert_eq!(canonicalize("node.js"), "node.js");
+        assert_eq!(canonicalize("a/b"), "a/b");
+    }
+
+    #[test]
+    fn canonicalize_empty_when_all_punctuation() {
+        assert_eq!(canonicalize("..."), "");
+        assert_eq!(canonicalize("   "), "");
+    }
+
+    // --- strip_fences -----------------------------------------------------
+
+    #[test]
+    fn strip_fences_removes_fenced_blocks_and_fence_lines() {
+        let body = "before\n```\ncode line\n```\nafter\n";
+        let stripped = strip_fences(body);
+        assert!(stripped.contains("before"));
+        assert!(stripped.contains("after"));
+        assert!(!stripped.contains("code line"));
+        assert!(!stripped.contains("```"));
+    }
+
+    #[test]
+    fn strip_fences_handles_language_hint_fences() {
+        let body = "text\n```rust\nlet x = 1;\n```\nmore\n";
+        let stripped = strip_fences(body);
+        assert!(!stripped.contains("let x = 1"));
+        assert!(stripped.contains("more"));
+    }
+
+    #[test]
+    fn strip_fences_unterminated_fence_swallows_rest() {
+        // An opening fence with no close drops everything after it.
+        let body = "keep\n```\ndropped\nalso dropped\n";
+        let stripped = strip_fences(body);
+        assert!(stripped.contains("keep"));
+        assert!(!stripped.contains("dropped"));
+    }
+
+    // --- wiki links -------------------------------------------------------
+
+    #[test]
+    fn extract_pulls_wiki_links() {
+        let e = extract("see [[On-call training]] and [[Replaybook]]", &names(&[]));
+        assert_eq!(e.wiki_links, vec!["On-call training", "Replaybook"]);
+    }
+
+    #[test]
+    fn extract_wiki_link_strips_anchor_and_alias() {
+        // [[target#section]] and [[target|display]] keep only the target.
+        let e = extract("[[Note#heading]] [[Target|shown as this]]", &names(&[]));
+        assert_eq!(e.wiki_links, vec!["Note", "Target"]);
+    }
+
+    #[test]
+    fn extract_ignores_wiki_links_inside_fences() {
+        let e = extract("real [[Kept]]\n```\n[[Dropped]]\n```\n", &names(&[]));
+        assert_eq!(e.wiki_links, vec!["Kept"]);
+    }
+
+    // --- code spans -------------------------------------------------------
+
+    #[test]
+    fn extract_pulls_short_code_spans() {
+        let e = extract("run `cargo` in `raft`", &names(&[]));
+        assert!(e.code_spans.contains(&"cargo".to_string()));
+        assert!(e.code_spans.contains(&"raft".to_string()));
+    }
+
+    #[test]
+    fn extract_keeps_spaced_span_under_40_chars() {
+        // Precedence: is_empty() || (contains(' ') && len > 40).
+        // A spaced span <= 40 chars is kept.
+        let e = extract("do `cargo build` now", &names(&[]));
+        assert!(e.code_spans.contains(&"cargo build".to_string()));
+    }
+
+    #[test]
+    fn extract_drops_long_spaced_span() {
+        let long = "a very long backticked phrase that exceeds forty chars";
+        let e = extract(&format!("`{long}`"), &names(&[]));
+        assert!(!e.code_spans.iter().any(|s| s == long));
+    }
+
+    // --- project dictionary matching -------------------------------------
+
+    #[test]
+    fn extract_matches_project_name_as_whole_word() {
+        let e = extract("working on replaybook today", &names(&["replaybook"]));
+        assert_eq!(e.project_mentions.get("replaybook"), Some(&1));
+    }
+
+    #[test]
+    fn extract_counts_repeated_mentions() {
+        let e = extract("replaybook and replaybook again", &names(&["replaybook"]));
+        assert_eq!(e.project_mentions.get("replaybook"), Some(&2));
+    }
+
+    #[test]
+    fn extract_respects_word_boundaries() {
+        // "arf" must not match inside "scarf" or "arfle".
+        let e = extract("a scarf and arfle", &names(&["arf"]));
+        assert!(!e.project_mentions.contains_key("arf"));
+    }
+
+    #[test]
+    fn extract_short_name_only_counts_when_backticked() {
+        // Names < 4 chars are dropped unless they appear as a code span.
+        let plain = extract("i will go home", &names(&["go"]));
+        assert!(!plain.project_mentions.contains_key("go"));
+
+        let backticked = extract("the `go` toolchain", &names(&["go"]));
+        assert_eq!(backticked.project_mentions.get("go"), Some(&1));
+    }
+
+    #[test]
+    fn extract_ignores_project_mentions_in_fences() {
+        let e = extract("prose\n```\nreplaybook in code\n```\n", &names(&["replaybook"]));
+        assert!(!e.project_mentions.contains_key("replaybook"));
+    }
+
+    // --- open loops -------------------------------------------------------
+
+    #[test]
+    fn loops_unchecked_boxes_anywhere() {
+        let body = "# Random\n- [ ] fix the thing\n- [x] already done\n";
+        let loops = extract_loops(body);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].text, "fix the thing");
+    }
+
+    #[test]
+    fn loops_plain_bullets_only_under_followup_headers() {
+        let body = "# Notes\n- just a note\n## Next steps\n- ship it\n";
+        let loops = extract_loops(body);
+        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["ship it"]);
+        assert_eq!(loops[0].section.as_deref(), Some("Next steps"));
+    }
+
+    #[test]
+    fn loops_followup_header_variants_match() {
+        for header in ["## Follow-ups", "## TODO", "## Loose ends", "## Open questions"] {
+            let body = format!("{header}\n- an item\n");
+            let loops = extract_loops(&body);
+            assert_eq!(loops.len(), 1, "header {header:?} should open a loop section");
+        }
+    }
+
+    #[test]
+    fn loops_fold_indented_continuation_lines() {
+        let body = "## Next\n- do a thing\n  with more detail\n";
+        let loops = extract_loops(body);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].text, "do a thing with more detail");
+    }
+
+    #[test]
+    fn loops_skip_fenced_content() {
+        let body = "## Next\n```\n- [ ] not a real loop\n```\n- [ ] real loop\n";
+        let loops = extract_loops(body);
+        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["real loop"]);
+    }
+
+    #[test]
+    fn loops_drop_completion_markers() {
+        let body = "## Next\n- [ ] done: shipped it\n- [ ] ~~scrapped~~\n- [ ] real one\n";
+        let loops = extract_loops(body);
+        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["real one"]);
+    }
+
+    #[test]
+    fn loops_header_resets_followup_section() {
+        // A non-followup header after a followup one stops plain-bullet capture.
+        let body = "## Next steps\n- captured\n## Random\n- not captured\n";
+        let loops = extract_loops(body);
+        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["captured"]);
+    }
+}
