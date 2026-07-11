@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
@@ -37,7 +37,26 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+
+-- Full-text index over note bodies. External-content: FTS5 reads the
+-- body from `notes` via node_id rather than storing a second copy.
+-- Kept in sync manually during rebuild (a full wipe-and-reinsert), so
+-- no sync triggers are needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    body,
+    content='notes',
+    content_rowid='node_id'
+);
 "#;
+
+/// Open an in-memory database with the current schema applied. Test-only
+/// helper so query tests don't touch the filesystem.
+#[cfg(test)]
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch(SCHEMA)?;
+    Ok(conn)
+}
 
 pub fn open_db() -> Result<Connection> {
     let path = crate::config::db_path()?;
@@ -51,7 +70,10 @@ pub fn open_db() -> Result<Connection> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
         conn.execute_batch(
-            "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS nodes;",
+            "DROP TABLE IF EXISTS notes_fts;
+             DROP TABLE IF EXISTS edges;
+             DROP TABLE IF EXISTS notes;
+             DROP TABLE IF EXISTS nodes;",
         )?;
     }
     conn.execute_batch(SCHEMA)?;
@@ -102,7 +124,9 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         .collect();
 
     let tx = conn.transaction()?;
-    tx.execute_batch("DELETE FROM edges; DELETE FROM notes; DELETE FROM nodes;")?;
+    tx.execute_batch(
+        "DELETE FROM notes_fts; DELETE FROM edges; DELETE FROM notes; DELETE FROM nodes;",
+    )?;
 
     for project in &projects {
         let meta = project
@@ -223,6 +247,11 @@ pub fn rebuild(config: &Config) -> Result<IndexStats> {
         [],
         |row| row.get(0),
     )?;
+
+    // Rebuild the FTS index from the now-populated `notes` content table
+    // in one pass. Cheaper and less error-prone than per-row FTS inserts.
+    tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])?;
+
     tx.commit()?;
 
     Ok(IndexStats {
