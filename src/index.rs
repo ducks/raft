@@ -6,7 +6,7 @@ use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
@@ -295,19 +295,21 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
             edge_count += 1;
         }
 
-        for open_loop in extract::extract_loops(&note.body) {
-            let meta = serde_json::json!({ "section": open_loop.section }).to_string();
-            // Identical text across notes intentionally merges into one
-            // loop node; multiple 'contains' edges record every sighting.
+        for (ordinal, open_loop) in extract::extract_loops(&note.body).into_iter().enumerate() {
+            let identity = format!("{name}#loop-{ordinal}");
+            let meta = serde_json::json!({
+                "text": &open_loop.text,
+                "section": &open_loop.section,
+            })
+            .to_string();
+            // A loop is an occurrence in one note, not a globally canonical
+            // task. Repeated text remains independently attributable to its
+            // own note, date, section, and project edges.
             tx.execute(
-                "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('loop', ?1, ?2)",
-                params![open_loop.text, meta],
+                "INSERT INTO nodes (kind, name, path, meta) VALUES ('loop', ?1, ?2, ?3)",
+                params![identity, name, meta],
             )?;
-            let loop_id: i64 = tx.query_row(
-                "SELECT id FROM nodes WHERE kind = 'loop' AND name = ?1",
-                params![open_loop.text],
-                |row| row.get(0),
-            )?;
+            let loop_id = tx.last_insert_rowid();
             insert_edge(
                 &tx,
                 note_id,
@@ -679,5 +681,39 @@ mod tests {
 
         assert_eq!(stats.entities, 1);
         assert!(crate::query::about(&conn, "NIXOS,").unwrap().is_some());
+    }
+
+    #[test]
+    fn repeated_loop_text_keeps_each_occurrence_context() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let older_path = notes.join("2026-07-01.md");
+        let newer_path = notes.join("2026-07-10.md");
+        std::fs::write(&older_path, "## Next steps\n- write tests\n").unwrap();
+        std::fs::write(&newer_path, "## Follow-ups\n- write tests\n").unwrap();
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: notes.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
+
+        let stats = rebuild_at(&config, &live_path).unwrap();
+        let conn = open_db_at(&live_path).unwrap();
+        let dangling = crate::query::dangling(&conn, None, 10).unwrap();
+
+        assert_eq!(stats.loops, 2);
+        assert_eq!(dangling.len(), 2);
+        assert_eq!(dangling[0].text, "write tests");
+        assert_eq!(dangling[0].section.as_deref(), Some("Next steps"));
+        assert_eq!(dangling[0].first_seen.as_deref(), Some("2026-07-01"));
+        assert_eq!(dangling[0].note_path, older_path.to_string_lossy());
+        assert_eq!(dangling[1].section.as_deref(), Some("Follow-ups"));
+        assert_eq!(dangling[1].first_seen.as_deref(), Some("2026-07-10"));
+        assert_eq!(dangling[1].note_path, newer_path.to_string_lossy());
+        assert!(dangling.iter().all(|item| item.sightings == 2));
     }
 }

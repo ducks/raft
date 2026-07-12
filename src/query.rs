@@ -192,7 +192,11 @@ pub fn why(conn: &Connection, name: &str, min_weight: f64) -> Result<Option<Vec<
     };
 
     let mut stmt = conn.prepare(
-        "SELECT src.name, src.kind, e.kind, e.provenance, e.weight, e.rationale
+        "SELECT CASE src.kind
+                    WHEN 'loop' THEN json_extract(src.meta, '$.text')
+                    ELSE src.name
+                END,
+                src.kind, e.kind, e.provenance, e.weight, e.rationale
          FROM edges e
          JOIN nodes src ON src.id = e.src
          WHERE e.dst = ?1 AND e.weight >= ?2
@@ -224,8 +228,10 @@ pub struct Dangling {
     pub note_path: String,
 }
 
-/// Open loops, stalest first. `about` filters to loops whose text
-/// mentions the given project or entity.
+/// Open-loop occurrences, stalest first. Identical text remains separate so
+/// every result retains its own note, date, section, and project associations.
+/// `sightings` reports how many occurrences share that exact text. `about`
+/// filters to occurrences whose text mentions the given project or entity.
 pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<Vec<Dangling>> {
     let about_id: Option<i64> = match about {
         None => None,
@@ -239,18 +245,25 @@ pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<
     };
 
     let mut stmt = conn.prepare(
-        "SELECT l.name, l.meta,
-                MIN(COALESCE(n.note_date, n.mtime)) AS first_seen,
-                COUNT(DISTINCT e.src) AS sightings,
-                MIN(src_node.path) AS note_path
+        "WITH repetition AS (
+             SELECT json_extract(meta, '$.text') AS text, COUNT(*) AS sightings
+             FROM nodes
+             WHERE kind = 'loop'
+             GROUP BY text
+         )
+         SELECT json_extract(l.meta, '$.text') AS text,
+                json_extract(l.meta, '$.section') AS section,
+                COALESCE(n.note_date, n.mtime) AS first_seen,
+                repetition.sightings,
+                src_node.path AS note_path
          FROM nodes l
+         JOIN repetition ON repetition.text = json_extract(l.meta, '$.text')
          JOIN edges e ON e.dst = l.id AND e.kind = 'contains'
          JOIN notes n ON n.node_id = e.src
          JOIN nodes src_node ON src_node.id = e.src
          WHERE l.kind = 'loop'
            AND (?1 IS NULL OR l.id IN
                 (SELECT src FROM edges WHERE dst = ?1 AND kind = 'mentions'))
-         GROUP BY l.id
          ORDER BY first_seen ASC NULLS LAST
          LIMIT ?2",
     )?;
@@ -258,19 +271,16 @@ pub fn dangling(conn: &Connection, about: Option<&str>, limit: usize) -> Result<
     let today = chrono::Local::now().date_naive();
     let rows = stmt.query_map(params![about_id, limit as i64], |row| {
         let text: String = row.get(0)?;
-        let meta: String = row.get(1)?;
+        let section: Option<String> = row.get(1)?;
         let first_seen: Option<String> = row.get(2)?;
         let sightings: i64 = row.get(3)?;
         let note_path: String = row.get(4)?;
-        Ok((text, meta, first_seen, sightings, note_path))
+        Ok((text, section, first_seen, sightings, note_path))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (text, meta, first_seen, sightings, note_path) = row?;
-        let section = serde_json::from_str::<serde_json::Value>(&meta)
-            .ok()
-            .and_then(|v| v.get("section").and_then(|s| s.as_str()).map(String::from));
+        let (text, section, first_seen, sightings, note_path) = row?;
         let age_days = first_seen
             .as_deref()
             .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
