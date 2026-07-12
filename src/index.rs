@@ -2,11 +2,12 @@ use crate::config::{Config, SourceKind};
 use crate::extract;
 use crate::scan;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
@@ -38,6 +39,11 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+
+CREATE TABLE IF NOT EXISTS index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 -- Full-text index over note bodies. External-content: FTS5 reads the
 -- body from `notes` via node_id rather than storing a second copy.
@@ -150,6 +156,127 @@ pub struct IndexStats {
     pub entities: usize,
     pub edges: usize,
     pub loops: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexStatus {
+    pub database: String,
+    pub indexed: bool,
+    pub healthy: bool,
+    pub schema_version: Option<i64>,
+    pub expected_schema_version: i64,
+    pub last_rebuilt: Option<String>,
+    pub counts: Option<IndexCounts>,
+    pub error: Option<String>,
+    pub sources: Vec<SourceStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexCounts {
+    pub notes: i64,
+    pub projects: i64,
+    pub entities: i64,
+    pub loops: i64,
+    pub edges: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceStatus {
+    pub kind: String,
+    pub configured_path: String,
+    pub path: String,
+    pub healthy: bool,
+    pub error: Option<String>,
+}
+
+pub fn status(config: &Config) -> Result<IndexStatus> {
+    status_at(config, &crate::config::db_path()?)
+}
+
+fn status_at(config: &Config, path: &Path) -> Result<IndexStatus> {
+    let sources = config.sources.iter().map(source_status).collect();
+    let mut status = IndexStatus {
+        database: path.to_string_lossy().into_owned(),
+        indexed: path.exists(),
+        healthy: false,
+        schema_version: None,
+        expected_schema_version: SCHEMA_VERSION,
+        last_rebuilt: None,
+        counts: None,
+        error: None,
+        sources,
+    };
+    if !status.indexed {
+        status.error = Some("index does not exist; run `raft index`".to_string());
+        return Ok(status);
+    }
+
+    let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(err) => {
+            status.error = Some(format!("could not open index: {err}"));
+            return Ok(status);
+        }
+    };
+    let version = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+        Ok(version) => version,
+        Err(err) => {
+            status.error = Some(format!("could not read schema version: {err}"));
+            return Ok(status);
+        }
+    };
+    status.schema_version = Some(version);
+    if version != SCHEMA_VERSION {
+        status.error = Some(format!(
+            "schema {version} is stale; expected {SCHEMA_VERSION}; run `raft index`"
+        ));
+        return Ok(status);
+    }
+
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        status.error = Some(format!("index failed integrity check: {integrity}"));
+        return Ok(status);
+    }
+    status.last_rebuilt = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'last_rebuilt'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let (notes, projects, entities, loops): (i64, i64, i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(kind = 'note'), 0),
+                COALESCE(SUM(kind = 'project'), 0),
+                COALESCE(SUM(kind = 'entity'), 0),
+                COALESCE(SUM(kind = 'loop'), 0)
+         FROM nodes",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let edges = conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
+    status.counts = Some(IndexCounts {
+        notes,
+        projects,
+        entities,
+        loops,
+        edges,
+    });
+    status.healthy = true;
+    Ok(status)
+}
+
+fn source_status(source: &crate::config::Source) -> SourceStatus {
+    let path = crate::config::expand_tilde(&source.path);
+    let result = std::fs::read_dir(&path);
+    let error = result.err().map(|err| err.to_string());
+    SourceStatus {
+        kind: format!("{:?}", source.kind).to_lowercase(),
+        configured_path: source.path.clone(),
+        path: path.to_string_lossy().into_owned(),
+        healthy: error.is_none(),
+        error,
+    }
 }
 
 /// Full rebuild: scan every source, replace the index.
@@ -351,6 +478,10 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     // Rebuild the FTS index from the now-populated `notes` content table
     // in one pass. Cheaper and less error-prone than per-row FTS inserts.
     tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])?;
+    tx.execute(
+        "INSERT INTO index_meta (key, value) VALUES ('last_rebuilt', ?1)",
+        params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+    )?;
 
     tx.commit()?;
 
@@ -715,5 +846,57 @@ mod tests {
         assert_eq!(dangling[1].first_seen.as_deref(), Some("2026-07-10"));
         assert_eq!(dangling[1].note_path, newer_path.to_string_lossy());
         assert!(dangling.iter().all(|item| item.sightings == 2));
+    }
+
+    #[test]
+    fn status_reports_rebuild_metadata_counts_and_sources() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(notes.join("note.md"), "See [[NixOS]].").unwrap();
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: notes.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
+        rebuild_at(&config, &live_path).unwrap();
+
+        let status = status_at(&config, &live_path).unwrap();
+
+        assert!(status.indexed);
+        assert!(status.healthy);
+        assert_eq!(status.schema_version, Some(SCHEMA_VERSION));
+        assert!(status.last_rebuilt.is_some());
+        let counts = status.counts.unwrap();
+        assert_eq!(counts.notes, 1);
+        assert_eq!(counts.entities, 1);
+        assert_eq!(counts.edges, 1);
+        assert_eq!(status.sources.len(), 1);
+        assert!(status.sources[0].healthy);
+    }
+
+    #[test]
+    fn status_is_useful_when_index_and_source_are_missing() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let missing = dir.path().join("missing");
+        let config = Config {
+            sources: vec![crate::config::Source {
+                path: missing.to_string_lossy().into_owned(),
+                kind: SourceKind::Notes,
+            }],
+            ignore: Vec::new(),
+        };
+
+        let status = status_at(&config, &live_path).unwrap();
+
+        assert!(!status.indexed);
+        assert!(!status.healthy);
+        assert!(status.error.unwrap().contains("does not exist"));
+        assert!(!status.sources[0].healthy);
+        assert!(status.sources[0].error.is_some());
     }
 }
