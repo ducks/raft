@@ -26,6 +26,7 @@ kind = "projects"
 ```
 raft init            # write default config
 raft index           # scan sources, rebuild the index
+raft status          # index health, freshness, counts, and source access
 raft search <term>   # full-text search across notes
 raft about <name>    # everything known about a project or entity
 ```

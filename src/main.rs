@@ -75,6 +75,11 @@ enum Command {
     Serve,
     /// List configured sources
     Sources,
+    /// Show index health, freshness, graph counts, and source accessibility
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -220,9 +225,58 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Status { json } => {
+            let cfg = config::Config::load()?;
+            let status = index::status(&cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_status(&status);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_status(status: &index::IndexStatus) {
+    let state = if status.healthy {
+        "healthy"
+    } else if !status.indexed {
+        "missing"
+    } else {
+        "needs attention"
+    };
+    println!("index:        {state}");
+    println!("database:     {}", status.database);
+    match status.schema_version {
+        Some(version) => println!(
+            "schema:       {version} (expected {})",
+            status.expected_schema_version
+        ),
+        None => println!("schema:       -"),
+    }
+    println!(
+        "last rebuilt: {}",
+        status.last_rebuilt.as_deref().unwrap_or("never")
+    );
+    if let Some(counts) = &status.counts {
+        println!(
+            "graph:        {} notes, {} projects, {} entities, {} loops, {} edges",
+            counts.notes, counts.projects, counts.entities, counts.loops, counts.edges
+        );
+    }
+    if let Some(error) = &status.error {
+        println!("error:        {error}");
+    }
+    println!("sources:");
+    for source in &status.sources {
+        let state = if source.healthy { "ok" } else { "error" };
+        println!("  {:9} {:5} {}", source.kind, state, source.path);
+        if let Some(error) = &source.error {
+            println!("                  {error}");
+        }
+    }
 }
 
 /// Note sources are stored by full path; show just the filename. Other
