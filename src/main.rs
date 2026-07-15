@@ -98,6 +98,12 @@ fn main() -> Result<()> {
                 "indexed {} notes, {} projects, {} entities, {} loops, {} edges",
                 stats.notes, stats.projects, stats.entities, stats.loops, stats.edges
             );
+            if stats.git_cached > 0 || stats.git_refreshed > 0 {
+                println!(
+                    "git: {} refreshed, {} reused from cache",
+                    stats.git_refreshed, stats.git_cached
+                );
+            }
         }
         Command::Search { term, limit, json } => {
             let conn = index::open_db()?;

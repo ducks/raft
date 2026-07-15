@@ -16,8 +16,13 @@ pub struct NoteFile {
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
-    /// JSON blob of git metadata (branch, recent commits), if the dir is a repo.
-    pub git_meta: Option<serde_json::Value>,
+    /// Whether this project directory is a git repository.
+    pub is_repo: bool,
+    /// Cheap staleness signal for the repo's git metadata (newest mtime among
+    /// the reflog / HEAD / index). If this matches the value stored in the
+    /// live index, the cached git metadata can be reused instead of shelling
+    /// out to git again. `None` for non-repos or when it can't be read.
+    pub git_fingerprint: Option<String>,
 }
 
 pub fn scan_notes(root: &Path) -> Result<Vec<NoteFile>> {
@@ -91,8 +96,11 @@ pub fn scan_projects(root: &Path) -> Result<Vec<Project>> {
             Some(n) if !n.starts_with('.') => n.to_string(),
             _ => continue,
         };
-        let git_meta = if path.join(".git").exists() {
-            git_metadata(&path)
+        let is_repo = path.join(".git").exists();
+        // Cheap stat-only fingerprint here; the expensive `git log` is
+        // deferred to `git_metadata`, called only on a cache miss.
+        let git_fingerprint = if is_repo {
+            git_fingerprint(&path)
         } else {
             None
         };
@@ -100,14 +108,40 @@ pub fn scan_projects(root: &Path) -> Result<Vec<Project>> {
         projects.push(Project {
             name,
             path,
-            git_meta,
+            is_repo,
+            git_fingerprint,
         });
     }
 
     Ok(projects)
 }
 
-fn git_metadata(repo: &Path) -> Option<serde_json::Value> {
+/// A cheap staleness signal for a repo's git state: the newest mtime among
+/// `.git/logs/HEAD` (touched by every commit/checkout/reset/merge), `.git/HEAD`
+/// (branch switches), and `.git/index` (staging). No subprocess. Returns None
+/// if none can be stat'd (e.g. reflogs disabled and a bare-ish layout), in
+/// which case the caller treats the repo as always-stale and refreshes.
+pub fn git_fingerprint(repo: &Path) -> Option<String> {
+    let git_dir = repo.join(".git");
+    let candidates = [
+        git_dir.join("logs").join("HEAD"),
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+    ];
+    let newest = candidates
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .max()?;
+    Some(newest.to_string())
+}
+
+/// Full git metadata (branch + recent commits) for a repo. This is the
+/// expensive path: two `git` subprocesses. Called only when the fingerprint
+/// shows the repo changed since the last index.
+pub fn git_metadata(repo: &Path) -> Option<serde_json::Value> {
     let branch = git_output(repo, &["branch", "--show-current"])?;
     let log = git_output(
         repo,
@@ -218,5 +252,74 @@ mod tests {
 
         assert!(err.contains("could not read projects source"), "{err}");
         assert!(err.contains(missing.to_str().unwrap()), "{err}");
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "one"]);
+    }
+
+    #[test]
+    fn git_fingerprint_none_for_non_repo() {
+        let dir = TempDir::new().unwrap();
+        assert!(git_fingerprint(dir.path()).is_none());
+    }
+
+    #[test]
+    fn git_fingerprint_stable_without_changes() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        let a = git_fingerprint(dir.path());
+        let b = git_fingerprint(dir.path());
+        assert!(a.is_some());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn git_fingerprint_changes_after_commit() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        let before = git_fingerprint(dir.path());
+        std::fs::write(dir.path().join("b.txt"), "two").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "two"]);
+        let after = git_fingerprint(dir.path());
+        assert_ne!(before, after, "a commit must change the fingerprint");
+    }
+
+    #[test]
+    fn scan_projects_reports_repo_and_fingerprint() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("myrepo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::create_dir(root.path().join("plain")).unwrap();
+
+        let projects = scan_projects(root.path()).unwrap();
+        let repo_p = projects.iter().find(|p| p.name == "myrepo").unwrap();
+        let plain_p = projects.iter().find(|p| p.name == "plain").unwrap();
+
+        assert!(repo_p.is_repo);
+        assert!(repo_p.git_fingerprint.is_some());
+        assert!(!plain_p.is_repo);
+        assert!(plain_p.git_fingerprint.is_none());
     }
 }
