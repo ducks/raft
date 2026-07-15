@@ -343,7 +343,13 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     let mut git_cached = 0usize;
     for project in &projects {
         let path_key = project.path.to_string_lossy().into_owned();
-        let meta = project_meta(project, &git_cache, &path_key, &mut git_refreshed, &mut git_cached);
+        let meta = project_meta(
+            project,
+            &git_cache,
+            &path_key,
+            &mut git_refreshed,
+            &mut git_cached,
+        );
         // Same directory name can exist under multiple sources (tmp, notes,
         // scratch dirs); first source wins for v0.
         tx.execute(
