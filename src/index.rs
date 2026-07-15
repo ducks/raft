@@ -156,6 +156,12 @@ pub struct IndexStats {
     pub entities: usize,
     pub edges: usize,
     pub loops: usize,
+    /// Repos whose git metadata was reused from the previous index (fingerprint
+    /// unchanged), skipping the git subprocesses.
+    pub git_cached: usize,
+    /// Repos whose git metadata was refreshed by shelling out to git (new,
+    /// changed, or fingerprint unavailable).
+    pub git_refreshed: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,6 +311,12 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         }
     }
 
+    // Load cached git metadata from the live index (if any) so unchanged
+    // repos can skip the git subprocesses. Keyed by project path; each entry
+    // is (stored fingerprint, full meta JSON). Missing/unreadable index just
+    // yields an empty cache and every repo is refreshed.
+    let git_cache = load_git_cache(live_path).unwrap_or_default();
+
     let temporary = TemporaryIndex::beside(live_path)?;
     let mut conn = create_db_at(&temporary.path)?;
 
@@ -327,17 +339,16 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     )?;
 
     let mut project_ids = HashMap::new();
+    let mut git_refreshed = 0usize;
+    let mut git_cached = 0usize;
     for project in &projects {
-        let meta = project
-            .git_meta
-            .as_ref()
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "{}".to_string());
+        let path_key = project.path.to_string_lossy().into_owned();
+        let meta = project_meta(project, &git_cache, &path_key, &mut git_refreshed, &mut git_cached);
         // Same directory name can exist under multiple sources (tmp, notes,
         // scratch dirs); first source wins for v0.
         tx.execute(
             "INSERT OR IGNORE INTO nodes (kind, name, path, meta) VALUES ('project', ?1, ?2, ?3)",
-            params![project.name, project.path.to_string_lossy(), meta],
+            params![project.name, &path_key, meta],
         )?;
         let project_id: i64 = tx.query_row(
             "SELECT id FROM nodes WHERE kind = 'project' AND name = ?1",
@@ -491,6 +502,8 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
         entities: entity_count as usize,
         edges: edge_count,
         loops: loop_count,
+        git_cached,
+        git_refreshed,
     };
 
     validate_index(&conn)?;
@@ -498,6 +511,77 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     temporary.install(live_path)?;
 
     Ok(stats)
+}
+
+/// Load cached git state from the live index: project path -> (fingerprint,
+/// full meta JSON string). Opens read-only and tolerates any error (missing
+/// index, stale schema, unreadable) by returning an empty cache, which just
+/// means every repo gets refreshed - correctness never depends on the cache.
+fn load_git_cache(live_path: &Path) -> Result<HashMap<String, (String, String)>> {
+    let conn = Connection::open_with_flags(live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Ok(HashMap::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT path, meta FROM nodes WHERE kind = 'project' AND path IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        let path: String = row.get(0)?;
+        let meta: String = row.get(1)?;
+        Ok((path, meta))
+    })?;
+    let mut cache = HashMap::new();
+    for row in rows {
+        let (path, meta) = row?;
+        if let Some(fp) = serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|v| {
+                v.get("git_fingerprint")
+                    .and_then(|f| f.as_str())
+                    .map(String::from)
+            })
+        {
+            cache.insert(path, (fp, meta));
+        }
+    }
+    Ok(cache)
+}
+
+/// Produce the meta JSON to store for a project node, reusing cached git
+/// metadata when the repo's fingerprint is unchanged and refreshing (a git
+/// subprocess) otherwise. The stored object carries `git_fingerprint`
+/// alongside the `branch`/`commits` fields the queries read.
+fn project_meta(
+    project: &scan::Project,
+    git_cache: &HashMap<String, (String, String)>,
+    path_key: &str,
+    refreshed: &mut usize,
+    cached: &mut usize,
+) -> String {
+    if !project.is_repo {
+        return "{}".to_string();
+    }
+
+    // Reuse the cached meta verbatim when the fingerprint matches.
+    if let Some(fp) = &project.git_fingerprint {
+        if let Some((cached_fp, cached_meta)) = git_cache.get(path_key) {
+            if cached_fp == fp {
+                *cached += 1;
+                return cached_meta.clone();
+            }
+        }
+    }
+
+    // Miss: shell out for fresh metadata and stamp the current fingerprint.
+    *refreshed += 1;
+    let mut meta = scan::git_metadata(&project.path).unwrap_or_else(|| serde_json::json!({}));
+    if let (Some(obj), Some(fp)) = (meta.as_object_mut(), &project.git_fingerprint) {
+        obj.insert(
+            "git_fingerprint".to_string(),
+            serde_json::Value::String(fp.clone()),
+        );
+    }
+    meta.to_string()
 }
 
 fn validate_index(conn: &Connection) -> Result<()> {
@@ -898,5 +982,101 @@ mod tests {
         assert!(status.error.unwrap().contains("does not exist"));
         assert!(!status.sources[0].healthy);
         assert!(status.sources[0].error.is_some());
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn projects_config(projects: &Path) -> Config {
+        Config {
+            sources: vec![crate::config::Source {
+                path: projects.to_string_lossy().into_owned(),
+                kind: SourceKind::Projects,
+            }],
+            ignore: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn git_metadata_reused_when_repo_unchanged_then_refreshed_after_commit() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let projects = dir.path().join("projects");
+        let repo = projects.join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+
+        let config = projects_config(&projects);
+
+        // First build: nothing cached, so the repo is refreshed.
+        let first = rebuild_at(&config, &live_path).unwrap();
+        assert_eq!(first.git_refreshed, 1);
+        assert_eq!(first.git_cached, 0);
+
+        // Second build with no change: fingerprint matches, metadata reused.
+        let second = rebuild_at(&config, &live_path).unwrap();
+        assert_eq!(second.git_cached, 1, "unchanged repo should hit the cache");
+        assert_eq!(second.git_refreshed, 0);
+
+        // The cached metadata must still be correct/queryable.
+        let conn = open_db_at(&live_path).unwrap();
+        let about = crate::query::about(&conn, "myrepo").unwrap().unwrap();
+        assert_eq!(about.kind, "project");
+        assert!(about.git.is_some());
+        drop(conn);
+
+        // A new commit changes the fingerprint: refresh again.
+        std::fs::write(repo.join("b.txt"), "two").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "two"]);
+        let third = rebuild_at(&config, &live_path).unwrap();
+        assert_eq!(third.git_refreshed, 1, "a commit must force a refresh");
+        assert_eq!(third.git_cached, 0);
+    }
+
+    #[test]
+    fn stored_project_meta_carries_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("raft.db");
+        let projects = dir.path().join("projects");
+        let repo = projects.join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "x"]);
+
+        let config = projects_config(&projects);
+        rebuild_at(&config, &live_path).unwrap();
+
+        let conn = open_db_at(&live_path).unwrap();
+        let meta: String = conn
+            .query_row(
+                "SELECT meta FROM nodes WHERE kind = 'project' AND name = 'r'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert!(v.get("git_fingerprint").and_then(|f| f.as_str()).is_some());
+        // The query-facing fields are still at the top level, not nested.
+        assert!(v.get("branch").is_some());
+        assert!(v.get("commits").is_some());
     }
 }

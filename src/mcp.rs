@@ -244,8 +244,15 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
             let cfg = config::Config::load()?;
             let stats = index::rebuild(&cfg)?;
             Ok(format!(
-                "indexed {} notes, {} projects, {} entities, {} loops, {} edges",
-                stats.notes, stats.projects, stats.entities, stats.loops, stats.edges
+                "indexed {} notes, {} projects, {} entities, {} loops, {} edges \
+                 (git: {} refreshed, {} reused from cache)",
+                stats.notes,
+                stats.projects,
+                stats.entities,
+                stats.loops,
+                stats.edges,
+                stats.git_refreshed,
+                stats.git_cached
             ))
         }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
