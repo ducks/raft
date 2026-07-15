@@ -67,6 +67,11 @@ enum Command {
         /// Minimum shared notes / shared commit days for a pair
         #[arg(long, default_value_t = 3)]
         min: i64,
+        /// Hide edges below this confidence weight before pairing.
+        /// The default excludes weak backticked-span guesses (weight 0.3);
+        /// use --min-weight 0 to include everything
+        #[arg(long, default_value_t = 0.5)]
+        min_weight: f64,
         #[arg(long, default_value_t = 15)]
         limit: usize,
         #[arg(long)]
@@ -204,9 +209,14 @@ fn main() -> Result<()> {
                 println!("\n{} open loops", loops.len());
             }
         }
-        Command::Connect { min, limit, json } => {
+        Command::Connect {
+            min,
+            min_weight,
+            limit,
+            json,
+        } => {
             let conn = index::open_db()?;
-            let connections = query::connect(&conn, min, limit)?;
+            let connections = query::connect(&conn, min, min_weight, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&connections)?);
             } else {

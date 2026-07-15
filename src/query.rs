@@ -324,7 +324,15 @@ pub struct Connections {
 /// Surface connections nobody wrote down: node pairs that keep
 /// appearing in the same notes (affinity-scored so hub nodes don't
 /// drown everything), and projects whose commits land on the same days.
-pub fn connect(conn: &Connection, min_shared: i64, limit: usize) -> Result<Connections> {
+/// `min_weight` drops low-confidence edges before pairing: the weak
+/// backticked-span guesses (weight 0.3) otherwise flood the results with
+/// pseudo-entities like `index.html` and `cargo.toml`.
+pub fn connect(
+    conn: &Connection,
+    min_shared: i64,
+    min_weight: f64,
+    limit: usize,
+) -> Result<Connections> {
     // A pair is only interesting if it keeps reuniting over time;
     // co-occurrence inside one burst of notes is just one story's
     // vocabulary. Require the shared notes to span at least two weeks.
@@ -337,6 +345,7 @@ pub fn connect(conn: &Connection, min_shared: i64, limit: usize) -> Result<Conne
              JOIN notes nt ON nt.node_id = e.src
              WHERE e.kind IN ('mentions', 'wikilink')
                AND n.kind IN ('project', 'entity')
+               AND e.weight >= ?2
          ),
          freq AS (SELECT target, COUNT(*) AS c FROM mention GROUP BY target)
          SELECT na.name, na.kind, nb.name, nb.kind,
@@ -353,7 +362,7 @@ pub fn connect(conn: &Connection, min_shared: i64, limit: usize) -> Result<Conne
     )?;
 
     let mut co_mentions: Vec<CoMentionPair> = stmt
-        .query_map(params![min_shared], |row| {
+        .query_map(params![min_shared, min_weight], |row| {
             let shared: i64 = row.get(4)?;
             let fa: i64 = row.get(5)?;
             let fb: i64 = row.get(6)?;
@@ -709,5 +718,68 @@ mod tests {
         assert_eq!(found[0].note, "notes/a.md");
 
         assert!(find_open_loops(&conn, "nonexistent").unwrap().is_empty());
+    }
+
+    /// Insert a dated note and return its node id, for building edges.
+    fn add_dated_note(conn: &Connection, path: &str, date: &str) -> i64 {
+        add_note(conn, path, Some(date), "body");
+        conn.query_row(
+            "SELECT id FROM nodes WHERE kind = 'note' AND name = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Three notes spanning >2 weeks, each mentioning entities `a` and `b`
+    /// with strong edges and `weak` with 0.3-weight span-guess edges.
+    fn seed_connect_graph(conn: &Connection) {
+        let a = add_node(conn, "entity", "alpha");
+        let b = add_node(conn, "entity", "beta");
+        let weak = add_node(conn, "entity", "index.html");
+        for (i, date) in ["2026-01-01", "2026-01-10", "2026-01-20"]
+            .iter()
+            .enumerate()
+        {
+            let note = add_dated_note(conn, &format!("/n/{i}.md"), date);
+            add_edge(conn, note, a, "mentions", "indexer", 2.0, "matched 2x");
+            add_edge(conn, note, b, "mentions", "indexer", 1.0, "matched 1x");
+            add_edge(
+                conn,
+                note,
+                weak,
+                "mentions",
+                "indexer",
+                0.3,
+                "backticked span",
+            );
+        }
+    }
+
+    #[test]
+    fn connect_default_weight_excludes_span_guesses() {
+        let conn = open_in_memory().unwrap();
+        seed_connect_graph(&conn);
+
+        let out = connect(&conn, 3, 0.5, 15).unwrap();
+        assert_eq!(out.co_mentions.len(), 1, "only the strong pair survives");
+        let pair = &out.co_mentions[0];
+        assert_eq!((pair.a.as_str(), pair.b.as_str()), ("alpha", "beta"));
+    }
+
+    #[test]
+    fn connect_zero_weight_includes_everything() {
+        let conn = open_in_memory().unwrap();
+        seed_connect_graph(&conn);
+
+        let out = connect(&conn, 3, 0.0, 15).unwrap();
+        // alpha-beta, alpha-index.html, beta-index.html
+        assert_eq!(out.co_mentions.len(), 3);
+        assert!(
+            out.co_mentions
+                .iter()
+                .any(|p| p.a == "index.html" || p.b == "index.html"),
+            "weak entity pairs included at weight 0"
+        );
     }
 }

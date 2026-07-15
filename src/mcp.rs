@@ -172,6 +172,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "min": { "type": "integer", "default": 3, "description": "Minimum shared notes / shared commit days" },
+                    "min_weight": { "type": "number", "default": 0.5, "description": "Hide edges below this confidence weight before pairing; the default excludes weak backticked-span guesses (weight 0.3). Use 0 to include everything." },
                     "limit": { "type": "integer", "default": 15 },
                 },
             },
@@ -236,8 +237,16 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
         }
         "connect" => {
             let conn = index::open_db()?;
-            let connections =
-                query::connect(&conn, arg_int("min", 3), arg_int("limit", 15) as usize)?;
+            let min_weight = arguments
+                .get("min_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5);
+            let connections = query::connect(
+                &conn,
+                arg_int("min", 3),
+                min_weight,
+                arg_int("limit", 15) as usize,
+            )?;
             Ok(serde_json::to_string_pretty(&connections)?)
         }
         "reindex" => {
