@@ -425,6 +425,37 @@ pub fn connect(conn: &Connection, min_shared: i64, limit: usize) -> Result<Conne
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct LoopMatch {
+    pub text: String,
+    /// Note file the loop lives in. Each loop is one occurrence in one
+    /// note, so a match maps to exactly one note.
+    pub note: String,
+}
+
+/// Open loops whose text contains `pattern` (case-insensitive). The
+/// loop text lives in `meta.text`; the node name is a synthetic
+/// per-occurrence identity, so match on the extracted text.
+pub fn find_open_loops(conn: &Connection, pattern: &str) -> Result<Vec<LoopMatch>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(l.meta, '$.text') AS text, l.path
+         FROM nodes l
+         WHERE l.kind = 'loop'
+           AND instr(lower(json_extract(l.meta, '$.text')), lower(?1)) > 0
+         ORDER BY text",
+    )?;
+
+    let matches = stmt
+        .query_map(params![pattern], |row| {
+            Ok(LoopMatch {
+                text: row.get(0)?,
+                note: row.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(matches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +689,25 @@ mod tests {
         rebuild_fts(&conn);
 
         assert_eq!(search(&conn, "keyword", 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn find_open_loops_matches_text_in_meta_case_insensitive() {
+        let conn = open_in_memory().unwrap();
+        // A loop node: synthetic name, note path in `path`, text in meta.
+        conn.execute(
+            "INSERT INTO nodes (kind, name, path, meta)
+             VALUES ('loop', 'notes/a.md#loop-0', 'notes/a.md',
+                     json_object('text', 'Unpin try after vacation', 'section', 'Follow-ups'))",
+            [],
+        )
+        .unwrap();
+
+        let found = find_open_loops(&conn, "TRY").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Unpin try after vacation");
+        assert_eq!(found[0].note, "notes/a.md");
+
+        assert!(find_open_loops(&conn, "nonexistent").unwrap().is_empty());
     }
 }

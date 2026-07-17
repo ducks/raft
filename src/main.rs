@@ -1,3 +1,4 @@
+mod capture;
 mod config;
 mod extract;
 mod index;
@@ -70,6 +71,17 @@ enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Append a timestamped entry to today's daily note and reindex
+    Log {
+        /// The entry text (multiple words fine, no quotes needed)
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// Mark an open loop done in its source note(s) and reindex
+    Done {
+        /// Substring of the loop's text (must match exactly one loop)
+        pattern: String,
     },
     /// Serve the graph to agents as an MCP server over stdio
     Serve,
@@ -215,6 +227,41 @@ fn main() -> Result<()> {
                 }
                 if connections.co_mentions.is_empty() && connections.temporal.is_empty() {
                     println!("no connections above the threshold (try --min 2)");
+                }
+            }
+        }
+        Command::Log { text } => {
+            let cfg = config::Config::load()?;
+            let entry = text.join(" ");
+            let path = capture::append_log(&cfg, &entry)?;
+            index::rebuild(&cfg)?;
+            println!("logged to {}", path.display());
+        }
+        Command::Done { pattern } => {
+            let cfg = config::Config::load()?;
+            let conn = index::open_db()?;
+            let matches = query::find_open_loops(&conn, &pattern)?;
+            match matches.len() {
+                0 => println!("no open loop matches '{pattern}'"),
+                1 => {
+                    let m = &matches[0];
+                    let changed = capture::mark_done(&m.text, std::slice::from_ref(&m.note))?;
+                    if changed.is_empty() {
+                        println!("loop found in the index but not in the notes; run `raft index`");
+                    } else {
+                        index::rebuild(&cfg)?;
+                        println!("done: {}", m.text);
+                        for path in changed {
+                            println!("  updated {path}");
+                        }
+                    }
+                }
+                n => {
+                    println!("'{pattern}' matches {n} loops; be more specific:");
+                    for m in matches.iter().take(10) {
+                        let text: String = m.text.chars().take(90).collect();
+                        println!("  - {text}");
+                    }
                 }
             }
         }

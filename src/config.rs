@@ -10,9 +10,16 @@ pub struct Config {
     /// (compared canonically, so case-insensitive).
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// strftime-style path template for today's daily note, used by
+    /// `raft log`. Example: "~/notes/%Y/%Y-%m-%d.md"
+    #[serde(default)]
+    pub daily_note: Option<String>,
 }
 
+// deny_unknown_fields catches a real TOML trap: top-level keys placed
+// after a [[sources]] table silently become fields of that source.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub path: String,
     pub kind: SourceKind,
