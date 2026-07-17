@@ -108,6 +108,9 @@ pub struct Loop {
     pub text: String,
     /// The header the item was found under, if any.
     pub section: Option<String>,
+    /// Zero-based line index of the item's first line in the note,
+    /// so writers (`raft done`) can edit the exact line.
+    pub line: usize,
 }
 
 fn header_re() -> &'static Regex {
@@ -144,7 +147,7 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
     let mut in_fence = false;
     let mut open_item = false;
 
-    for line in body.lines() {
+    for (line_idx, line) in body.lines().enumerate() {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             open_item = false;
@@ -168,6 +171,7 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
                 loops.push(Loop {
                     text: cap[2].trim().to_string(),
                     section: current_header.clone(),
+                    line: line_idx,
                 });
                 open_item = true;
             }
@@ -179,6 +183,7 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
                 loops.push(Loop {
                     text: cap[1].trim().to_string(),
                     section: current_header.clone(),
+                    line: line_idx,
                 });
                 open_item = true;
                 continue;

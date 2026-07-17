@@ -767,6 +767,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         let stats = rebuild_at(&config, &path).unwrap();
@@ -789,6 +790,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         assert!(rebuild_at(&config, &path).is_err());
@@ -857,6 +859,7 @@ mod tests {
                 },
             ],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -895,6 +898,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -920,6 +924,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -951,6 +956,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
         rebuild_at(&config, &live_path).unwrap();
 
@@ -979,6 +985,7 @@ mod tests {
                 kind: SourceKind::Notes,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         };
 
         let status = status_at(&config, &live_path).unwrap();
@@ -1013,6 +1020,7 @@ mod tests {
                 kind: SourceKind::Projects,
             }],
             ignore: Vec::new(),
+            daily_note: None,
         }
     }
 
