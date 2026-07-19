@@ -1,6 +1,7 @@
 mod capture;
 mod config;
 mod extract;
+mod graph;
 mod index;
 mod mcp;
 mod query;
@@ -76,6 +77,22 @@ enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Render the neighborhood around a node as a graph (DOT or Mermaid).
+    /// Pipe DOT to `dot -Tsvg` or paste Mermaid into any renderer.
+    Graph {
+        /// Project or entity to center the graph on
+        name: String,
+        /// How many hops out from the start node to include
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// Hide edges below this confidence weight (weak backticked-span
+        /// guesses score 0.3); use 0 to include everything
+        #[arg(long, default_value_t = 0.5)]
+        min_weight: f64,
+        /// Output format: dot (Graphviz) or mermaid
+        #[arg(long, default_value = "dot")]
+        format: String,
     },
     /// Append a timestamped entry to today's daily note and reindex
     Log {
@@ -237,6 +254,28 @@ fn main() -> Result<()> {
                 }
                 if connections.co_mentions.is_empty() && connections.temporal.is_empty() {
                     println!("no connections above the threshold (try --min 2)");
+                }
+            }
+        }
+        Command::Graph {
+            name,
+            depth,
+            min_weight,
+            format,
+        } => {
+            let Some(fmt) = graph::GraphFormat::parse(&format) else {
+                eprintln!("unknown format '{format}' (expected: dot, mermaid)");
+                std::process::exit(2);
+            };
+            let conn = index::open_db()?;
+            match graph::neighborhood(&conn, &name, depth, min_weight)? {
+                None => println!("nothing known about '{name}' (try `raft index` first)"),
+                Some(sub) => {
+                    let out = match fmt {
+                        graph::GraphFormat::Dot => graph::to_dot(&sub),
+                        graph::GraphFormat::Mermaid => graph::to_mermaid(&sub),
+                    };
+                    print!("{out}");
                 }
             }
         }
