@@ -294,6 +294,7 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     // Scan projects first so notes can be matched against the dictionary.
     let mut projects = Vec::new();
     let mut all_notes = Vec::new();
+    let mut code_symbols = Vec::new();
 
     for source in &config.sources {
         let root = crate::config::expand_tilde(&source.path);
@@ -306,6 +307,27 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
             SourceKind::Notes => {
                 all_notes.extend(scan::scan_notes(&root).with_context(|| {
                     format!("failed to scan configured source {}", root.display())
+                })?)
+            }
+            SourceKind::Code => {
+                // A code source is itself a repo (indexed for its symbols).
+                // Also register it as a project so symbols can edge to it and
+                // its git state is queryable like any other repo.
+                if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                    let is_repo = root.join(".git").exists();
+                    projects.push(scan::Project {
+                        name: name.to_string(),
+                        path: root.clone(),
+                        is_repo,
+                        git_fingerprint: if is_repo {
+                            scan::git_fingerprint(&root)
+                        } else {
+                            None
+                        },
+                    });
+                }
+                code_symbols.extend(scan::scan_code(&root).with_context(|| {
+                    format!("failed to scan code source {}", root.display())
                 })?)
             }
         }
@@ -368,6 +390,38 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
 
     let mut edge_count = 0usize;
     let mut loop_count = 0usize;
+
+    // Code symbols become entity nodes carrying their file path, each with a
+    // high-confidence `defined_in` edge to the repo it lives in. This is the
+    // semantic layer: `raft about SummariesBackfill` now resolves to a real
+    // node that knows its file and repo, not just a prose mention. (They
+    // count in entity_count via the node query at the end of rebuild.)
+    for sym in &code_symbols {
+        let meta =
+            serde_json::json!({ "file": sym.file, "repo": sym.repo, "lang": sym.lang })
+                .to_string();
+        tx.execute(
+            "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('entity', ?1, ?2)",
+            params![sym.name, meta],
+        )?;
+        let sym_id: i64 = tx.query_row(
+            "SELECT id FROM nodes WHERE kind = 'entity' AND name = ?1",
+            params![sym.name],
+            |row| row.get(0),
+        )?;
+        if let Some(repo_id) = project_ids.get(&extract::canonicalize(&sym.repo)) {
+            insert_edge(
+                &tx,
+                sym_id,
+                *repo_id,
+                "defined_in",
+                "indexer",
+                1.0,
+                &format!("Ruby definition in {}", sym.file),
+            )?;
+            edge_count += 1;
+        }
+    }
 
     for note in &all_notes {
         let name = note.path.to_string_lossy().to_string();

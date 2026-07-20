@@ -25,6 +25,75 @@ pub struct Project {
     pub git_fingerprint: Option<String>,
 }
 
+/// A code symbol (class/module/function) found in a repo. Becomes a graph
+/// entity linked to the repo it lives in and the file that defines it.
+pub struct CodeSymbol {
+    /// Symbol name as written, e.g. `SummariesBackfill`.
+    pub name: String,
+    /// Repo-relative file path, e.g.
+    /// `plugins/discourse-ai/app/jobs/scheduled/summaries_backfill.rb`.
+    pub file: String,
+    /// The repo's directory name (the semantic "where it lives").
+    pub repo: String,
+    /// Which language's extractor produced this symbol.
+    pub lang: &'static str,
+}
+
+/// Walk a code repo and extract top-level symbol definitions, dispatching
+/// per file extension through the language table in `extract`. Deliberately
+/// shallow and dependency-free: definitions only (regex, not a parser);
+/// call graphs and references are out of scope. Adding a language is a
+/// change to `extract::languages()`, not to this function.
+pub fn scan_code(root: &Path) -> Result<Vec<CodeSymbol>> {
+    let repo = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut symbols = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip VCS, vendored deps, and test trees - noise, not structure.
+            let name = e.file_name().to_str().unwrap_or("");
+            !matches!(name, ".git" | "vendor" | "node_modules" | "spec" | "test" | "tmp")
+        })
+        .flatten()
+    {
+        let path = entry.path();
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        let lang = match crate::extract::lang_for_ext(ext) {
+            Some(l) => l,
+            None => continue,
+        };
+        let body = match std::fs::read_to_string(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        for caps in lang.def_re().captures_iter(&body) {
+            if let Some(name) = caps.get(1) {
+                symbols.push(CodeSymbol {
+                    name: name.as_str().to_string(),
+                    file: file.clone(),
+                    repo: repo.clone(),
+                    lang: lang.name,
+                });
+            }
+        }
+    }
+
+    Ok(symbols)
+}
+
 pub fn scan_notes(root: &Path) -> Result<Vec<NoteFile>> {
     let mut notes = Vec::new();
 
@@ -183,6 +252,51 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn scan_code_extracts_definitions_across_languages() {
+        let dir = TempDir::new().unwrap();
+        let jobs = dir.path().join("app/jobs/scheduled");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(
+            jobs.join("summaries_backfill.rb"),
+            "module Jobs\n  class SummariesBackfill < ::Jobs::Scheduled\n    def execute(args); end\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sync.py"),
+            "class ProfileSync:\n    def run(self):\n        pass\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("widget.ts"),
+            "export class Widget {}\nexport default function render() {}\nconst config = {};\n",
+        )
+        .unwrap();
+        // Noise that must be skipped: a spec dir and an unknown extension.
+        let spec = dir.path().join("spec");
+        std::fs::create_dir_all(&spec).unwrap();
+        std::fs::write(spec.join("thing_spec.rb"), "class ShouldBeSkipped; end\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# class NotCode\n").unwrap();
+
+        let symbols = scan_code(dir.path()).unwrap();
+        let named = |n: &str| symbols.iter().find(|s| s.name == n);
+
+        // Ruby
+        assert!(named("Jobs").is_some());
+        let backfill = named("SummariesBackfill").expect("ruby class");
+        assert_eq!(backfill.lang, "ruby");
+        assert!(backfill.file.ends_with("summaries_backfill.rb"));
+        // Python
+        assert_eq!(named("ProfileSync").expect("py class").lang, "python");
+        assert!(named("helper").is_some(), "python def");
+        // JS/TS
+        assert_eq!(named("Widget").expect("ts class").lang, "javascript");
+        assert!(named("render").is_some(), "ts function");
+        // Skipped
+        assert!(named("ShouldBeSkipped").is_none(), "spec/ skipped");
+        assert!(named("NotCode").is_none(), "non-code ext skipped");
+    }
 
     fn error_message<T>(result: Result<T>) -> String {
         match result {

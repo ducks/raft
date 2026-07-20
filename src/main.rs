@@ -398,6 +398,12 @@ fn shorten_source(name: &str, kind: &str) -> String {
 fn print_about(about: &query::About) {
     println!("{} ({})", about.name, about.kind);
 
+    if let Some(def) = &about.definition {
+        let file = def.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let repo = def.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        println!("\n  defined in: {repo}/{file}");
+    }
+
     if let Some(git) = &about.git {
         if let Some(branch) = git.get("branch").and_then(|b| b.as_str()) {
             println!("\n  branch: {branch}");

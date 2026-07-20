@@ -32,6 +32,10 @@ pub enum SourceKind {
     Notes,
     /// A directory whose immediate children are project repos.
     Projects,
+    /// A single code repo whose source files are scanned for symbols
+    /// (classes, modules, jobs) that become graph entities. Turns "this
+    /// repo exists" into "this class lives here, in this file".
+    Code,
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -80,9 +84,12 @@ impl Config {
         }
         let default = r#"# raft configuration
 #
-# Sources are directories raft indexes. Two kinds:
+# Sources are directories raft indexes. Three kinds:
 #   notes    - a tree of markdown files
 #   projects - a directory whose immediate children are project repos
+#   code     - a single repo, scanned for source symbols (classes,
+#              modules, functions in Ruby/Python/JS/TS) that become
+#              graph entities
 
 # [[sources]]
 # path = "~/notes"
@@ -91,6 +98,10 @@ impl Config {
 # [[sources]]
 # path = "~/dev"
 # kind = "projects"
+
+# [[sources]]
+# path = "~/src/some-repo"
+# kind = "code"
 "#;
         std::fs::write(&path, default)?;
         Ok(path)

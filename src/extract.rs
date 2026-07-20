@@ -24,6 +24,77 @@ fn code_span_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"`([^`\n]{2,80})`").unwrap())
 }
 
+/// A language raft can extract top-level symbols from: which file
+/// extensions it owns, its display name, and a regex whose first capture
+/// group is the defined symbol name. Definition-level only (classes,
+/// modules, functions) - not call graphs or references.
+pub struct Lang {
+    pub name: &'static str,
+    pub exts: &'static [&'static str],
+    re: fn() -> &'static Regex,
+}
+
+impl Lang {
+    pub fn def_re(&self) -> &'static Regex {
+        (self.re)()
+    }
+}
+
+/// The language table. Adding a language is a data change here, not a
+/// change to the scanner. Each regex is anchored to line start (after
+/// indentation) so it matches definitions, not mentions, and captures
+/// the symbol name in group 1.
+pub fn languages() -> &'static [Lang] {
+    &[
+        Lang {
+            name: "ruby",
+            exts: &["rb"],
+            re: ruby_def_re,
+        },
+        Lang {
+            name: "python",
+            exts: &["py"],
+            re: python_def_re,
+        },
+        Lang {
+            name: "javascript",
+            exts: &["js", "jsx", "ts", "tsx", "mjs"],
+            re: js_def_re,
+        },
+    ]
+}
+
+/// Look up the language that owns a file extension, if any.
+pub fn lang_for_ext(ext: &str) -> Option<&'static Lang> {
+    languages().iter().find(|l| l.exts.contains(&ext))
+}
+
+/// Ruby: `class Foo` / `module Bar`.
+fn ruby_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)^\s*(?:class|module)\s+([A-Z][A-Za-z0-9_:]*)").unwrap())
+}
+
+/// Python: `class Foo` / `def foo`.
+fn python_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+    })
+}
+
+/// JavaScript/TypeScript: `class Foo`, `function foo`, and the common
+/// `export (default) class/function/const Foo` forms.
+fn js_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^\s*(?:export\s+(?:default\s+)?)?(?:class|function\*?|const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        )
+        .unwrap()
+    })
+}
+
 pub fn extract(body: &str, project_names: &HashSet<String>) -> Extraction {
     let mut out = Extraction::default();
 

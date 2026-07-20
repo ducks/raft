@@ -69,6 +69,10 @@ pub struct About {
     pub name: String,
     pub kind: String,
     pub git: Option<serde_json::Value>,
+    /// For a code symbol: where it's defined (file + repo), from the
+    /// entity's own meta. None for non-code entities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<serde_json::Value>,
     pub notes: Vec<NoteRef>,
     pub co_mentioned: Vec<CoMention>,
 }
@@ -118,6 +122,15 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
         None
     };
 
+    // A code-symbol entity carries its definition site in meta.
+    let definition = if kind == "entity" {
+        serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .filter(|v| v.get("file").is_some())
+    } else {
+        None
+    };
+
     let mut stmt = conn.prepare(
         "SELECT DISTINCT nodes.path, notes.note_date
          FROM edges
@@ -161,6 +174,7 @@ pub fn about(conn: &Connection, name: &str) -> Result<Option<About>> {
         name: name.to_string(),
         kind,
         git,
+        definition,
         notes,
         co_mentioned,
     }))
