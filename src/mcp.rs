@@ -88,9 +88,17 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Tool {
 }
 
 fn call_tool(name: &str, arguments: &Value) -> Result<String> {
-    let arg_str = |key: &str| arguments.get(key).and_then(|v| v.as_str()).map(String::from);
+    let arg_str = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
     let arg_int = |key: &str, default: i64| {
-        arguments.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+        arguments
+            .get(key)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(default)
     };
 
     match name {
@@ -110,7 +118,10 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
         }
         "why" => {
             let name = arg_str("name").ok_or_else(|| anyhow::anyhow!("missing 'name'"))?;
-            let min_weight = arguments.get("min_weight").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let min_weight = arguments
+                .get("min_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let conn = index::open_db()?;
             match query::why(&conn, &name, min_weight)? {
                 Some(facts) => Ok(serde_json::to_string_pretty(&facts)?),
@@ -119,13 +130,25 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
         }
         "dangling" => {
             let conn = index::open_db()?;
-            let loops = query::dangling(&conn, arg_str("about").as_deref(), arg_int("limit", 50) as usize)?;
+            let loops = query::dangling(
+                &conn,
+                arg_str("about").as_deref(),
+                arg_int("limit", 50) as usize,
+            )?;
             Ok(serde_json::to_string_pretty(&loops)?)
         }
         "connect" => {
             let conn = index::open_db()?;
-            let min_weight = arguments.get("min_weight").and_then(|v| v.as_f64()).unwrap_or(0.5);
-            let connections = query::connect(&conn, arg_int("min", 3), min_weight, arg_int("limit", 15) as usize)?;
+            let min_weight = arguments
+                .get("min_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5);
+            let connections = query::connect(
+                &conn,
+                arg_int("min", 3),
+                min_weight,
+                arg_int("limit", 15) as usize,
+            )?;
             Ok(serde_json::to_string_pretty(&connections)?)
         }
         "reindex" => {
@@ -134,8 +157,13 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
             Ok(format!(
                 "indexed {} notes, {} projects, {} entities, {} loops, {} edges \
                  (git: {} refreshed, {} reused from cache)",
-                stats.notes, stats.projects, stats.entities, stats.loops, stats.edges,
-                stats.git_refreshed, stats.git_cached
+                stats.notes,
+                stats.projects,
+                stats.entities,
+                stats.loops,
+                stats.edges,
+                stats.git_refreshed,
+                stats.git_cached
             ))
         }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),

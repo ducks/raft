@@ -78,9 +78,7 @@ fn ruby_def_re() -> &'static Regex {
 /// Python: `class Foo` / `def foo`.
 fn python_def_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"(?m)^\s*(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap())
 }
 
 /// JavaScript/TypeScript: `class Foo`, `function foo`, and the common
