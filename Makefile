@@ -7,16 +7,22 @@ SHELL := /usr/bin/env bash
 # Calendar version: YYYYMMDD.0.X. The final component increments when more
 # than one release is cut on the same day. Override with VERSION=... when
 # preparing a historical or otherwise explicit release.
+#
+# The next version is always strictly higher than BOTH the latest v<today>
+# tag AND the version currently in Cargo.toml. Keying off tags alone can
+# collide with a version already committed to Cargo.toml (e.g. a release that
+# bumped the version but failed before tagging), which would make the bump a
+# no-op and silently abort the release. `make release` should always release.
 define get_next_version
 $(shell \
 	TODAY=$$(date +%Y%m%d); \
-	LATEST=$$(git tag -l "v$$TODAY.0.*" 2>/dev/null | sort -V | tail -1); \
-	if [ -z "$$LATEST" ]; then \
-		echo "$$TODAY.0.0"; \
-	else \
-		PATCH=$${LATEST##*.}; \
-		echo "$$TODAY.0.$$((PATCH + 1))"; \
-	fi \
+	TAG_PATCH=$$(git tag -l "v$$TODAY.0.*" 2>/dev/null | sort -V | tail -1 | sed -n 's/.*\.0\.\([0-9]*\)$$/\1/p'); \
+	CUR=$$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1); \
+	CUR_PATCH=$$(echo "$$CUR" | sed -n "s/^$$TODAY\.0\.\([0-9]*\)$$/\1/p"); \
+	NEXT=0; \
+	if [ -n "$$TAG_PATCH" ]; then NEXT=$$((TAG_PATCH + 1)); fi; \
+	if [ -n "$$CUR_PATCH" ] && [ "$$CUR_PATCH" -ge "$$NEXT" ]; then NEXT=$$((CUR_PATCH + 1)); fi; \
+	echo "$$TODAY.0.$$NEXT"; \
 )
 endef
 
@@ -53,6 +59,7 @@ version-bump:
 	@sed -i 's/^version = .*/version = "$(VERSION)"/' Cargo.toml
 	@cargo check --quiet
 	@git add Cargo.toml Cargo.lock
+	@git diff --cached --quiet && { echo "error: version $(VERSION) is already current - nothing to release" >&2; git switch main; git branch -D "$(RELEASE_BRANCH)"; exit 1; } || true
 	@git commit -m "chore: bump version to $(VERSION)"
 	@echo "Created release commit on $(RELEASE_BRANCH)"
 
