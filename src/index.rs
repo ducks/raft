@@ -326,9 +326,11 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
                         },
                     });
                 }
-                code_symbols.extend(scan::scan_code(&root).with_context(|| {
-                    format!("failed to scan code source {}", root.display())
-                })?)
+                code_symbols.extend(
+                    scan::scan_code(&root).with_context(|| {
+                        format!("failed to scan code source {}", root.display())
+                    })?,
+                )
             }
         }
     }
@@ -398,8 +400,7 @@ fn rebuild_at(config: &Config, live_path: &Path) -> Result<IndexStats> {
     // count in entity_count via the node query at the end of rebuild.)
     for sym in &code_symbols {
         let meta =
-            serde_json::json!({ "file": sym.file, "repo": sym.repo, "lang": sym.lang })
-                .to_string();
+            serde_json::json!({ "file": sym.file, "repo": sym.repo, "lang": sym.lang }).to_string();
         tx.execute(
             "INSERT OR IGNORE INTO nodes (kind, name, meta) VALUES ('entity', ?1, ?2)",
             params![sym.name, meta],

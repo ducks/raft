@@ -57,7 +57,10 @@ pub fn scan_code(root: &Path) -> Result<Vec<CodeSymbol>> {
         .filter_entry(|e| {
             // Skip VCS, vendored deps, and test trees - noise, not structure.
             let name = e.file_name().to_str().unwrap_or("");
-            !matches!(name, ".git" | "vendor" | "node_modules" | "spec" | "test" | "tmp")
+            !matches!(
+                name,
+                ".git" | "vendor" | "node_modules" | "spec" | "test" | "tmp"
+            )
         })
         .flatten()
     {
