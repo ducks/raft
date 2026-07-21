@@ -1,202 +1,96 @@
-//! MCP server over stdio: JSON-RPC 2.0, newline-delimited.
-//! stdout is protocol; anything human goes to stderr.
+//! MCP server over the graph, built on mcp-stdio.
+//!
+//! This module only describes raft's tools and runs them; the mcp-stdio
+//! crate owns the stdio JSON-RPC transport and dispatch. stdout is
+//! protocol; the startup line goes to stderr.
 
-use crate::{config, index, query};
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
 
-const PROTOCOL_VERSION: &str = "2025-06-18";
+use mcp_stdio::{serve as serve_stdio, Server, Tool};
+
+use crate::{config, index, query};
 
 pub fn serve() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
     eprintln!(
         "raft mcp server on stdio (db: {})",
         config::db_path()?.display()
     );
+    serve_stdio(&RaftServer);
+    Ok(())
+}
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                write_message(
-                    &mut stdout,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": null,
-                        "error": { "code": -32700, "message": format!("parse error: {e}") },
-                    }),
-                )?;
-                continue;
-            }
-        };
+struct RaftServer;
 
-        let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = message.get("id").cloned();
-
-        // Notifications (no id) expect no response.
-        let Some(id) = id else {
-            continue;
-        };
-
-        let response = match method {
-            "initialize" => {
-                let requested = message
-                    .pointer("/params/protocolVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(PROTOCOL_VERSION);
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": requested,
-                        "capabilities": { "tools": {} },
-                        "serverInfo": {
-                            "name": "raft",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                    },
-                })
-            }
-            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": tool_definitions() },
-            }),
-            "tools/call" => {
-                let name = message
-                    .pointer("/params/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = message
-                    .pointer("/params/arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                match call_tool(&name, &arguments) {
-                    Ok(text) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "content": [{ "type": "text", "text": text }] },
-                    }),
-                    Err(e) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": format!("error: {e}") }],
-                            "isError": true,
-                        },
-                    }),
-                }
-            }
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("method not found: {method}") },
-            }),
-        };
-
-        write_message(&mut stdout, &response)?;
+impl Server for RaftServer {
+    fn name(&self) -> &str {
+        "raft"
+    }
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
     }
 
-    Ok(())
-}
-
-fn write_message(stdout: &mut std::io::Stdout, message: &Value) -> Result<()> {
-    let mut line = serde_json::to_string(message)?;
-    line.push('\n');
-    stdout.write_all(line.as_bytes())?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "search",
-            "description": "Full-text search across all indexed notes. Returns matching notes with dates and snippets, newest first.",
-            "inputSchema": {
+    fn tools(&self) -> Vec<Tool> {
+        vec![
+            tool("search", "Full-text search across all indexed notes. Returns matching notes with dates and snippets, newest first.", json!({
                 "type": "object",
                 "properties": {
                     "term": { "type": "string", "description": "Text to search for" },
-                    "limit": { "type": "integer", "default": 20 },
+                    "limit": { "type": "integer", "default": 20 }
                 },
-                "required": ["term"],
-            },
-        },
-        {
-            "name": "about",
-            "description": "Everything the graph knows about a project or entity: git state (branch, recent commits), notes that mention it, and what it co-occurs with. Case-insensitive.",
-            "inputSchema": {
+                "required": ["term"]
+            })),
+            tool("about", "Everything the graph knows about a project or entity: git state (branch, recent commits), notes that mention it, its definition if it's a code symbol, and what it co-occurs with. Case-insensitive.", json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Project or entity name" }
+                },
+                "required": ["name"]
+            })),
+            tool("why", "Why a project or entity is in the graph: every edge pointing at it with provenance (human wiki link vs indexer heuristic), a confidence weight, and the rationale that created it. Use to audit whether a connection is trustworthy. Backticked-span mentions score 0.3; set min_weight to filter weak edges.", json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Project or entity name" },
+                    "min_weight": { "type": "number", "default": 0.0, "description": "Hide edges below this confidence weight" }
                 },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "why",
-            "description": "Why a project or entity is in the graph: every edge pointing at it with provenance (human wiki link vs indexer heuristic), a confidence weight, and the rationale that created it. Use to audit whether a connection is trustworthy. Backticked-span mentions score 0.3; set min_weight to filter weak edges.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Project or entity name" },
-                    "min_weight": { "type": "number", "default": 0.0, "description": "Hide edges below this confidence weight" },
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "dangling",
-            "description": "Open loops (follow-up items, unchecked boxes) across all notes, stalest first. Use to find forgotten work.",
-            "inputSchema": {
+                "required": ["name"]
+            })),
+            tool("dangling", "Open loops (follow-up items, unchecked boxes) across all notes, stalest first. Use to find forgotten work.", json!({
                 "type": "object",
                 "properties": {
                     "about": { "type": "string", "description": "Only loops mentioning this project or entity" },
-                    "limit": { "type": "integer", "default": 50 },
-                },
-            },
-        },
-        {
-            "name": "connect",
-            "description": "Connections nobody wrote down: pairs of projects/entities that keep co-occurring across notes over time (affinity-scored), and projects whose commits land on the same days.",
-            "inputSchema": {
+                    "limit": { "type": "integer", "default": 50 }
+                }
+            })),
+            tool("connect", "Connections nobody wrote down: pairs of projects/entities that keep co-occurring across notes over time (affinity-scored), and projects whose commits land on the same days.", json!({
                 "type": "object",
                 "properties": {
                     "min": { "type": "integer", "default": 3, "description": "Minimum shared notes / shared commit days" },
                     "min_weight": { "type": "number", "default": 0.5, "description": "Hide edges below this confidence weight before pairing; the default excludes weak backticked-span guesses (weight 0.3). Use 0 to include everything." },
-                    "limit": { "type": "integer", "default": 15 },
-                },
-            },
-        },
-        {
-            "name": "reindex",
-            "description": "Rescan all configured sources and rebuild the graph. Call after creating or editing notes so queries see the changes.",
-            "inputSchema": { "type": "object", "properties": {} },
-        },
-    ])
+                    "limit": { "type": "integer", "default": 15 }
+                }
+            })),
+            tool("reindex", "Rescan all configured sources and rebuild the graph. Call after creating or editing notes so queries see the changes.", json!({ "type": "object", "properties": {} })),
+        ]
+    }
+
+    fn call(&self, name: &str, args: &Value) -> Result<String, String> {
+        call_tool(name, args).map_err(|e| e.to_string())
+    }
+}
+
+fn tool(name: &str, description: &str, input_schema: Value) -> Tool {
+    Tool {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+    }
 }
 
 fn call_tool(name: &str, arguments: &Value) -> Result<String> {
-    let arg_str = |key: &str| {
-        arguments
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    };
+    let arg_str = |key: &str| arguments.get(key).and_then(|v| v.as_str()).map(String::from);
     let arg_int = |key: &str, default: i64| {
-        arguments
-            .get(key)
-            .and_then(|v| v.as_i64())
-            .unwrap_or(default)
+        arguments.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
     };
 
     match name {
@@ -216,10 +110,7 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
         }
         "why" => {
             let name = arg_str("name").ok_or_else(|| anyhow::anyhow!("missing 'name'"))?;
-            let min_weight = arguments
-                .get("min_weight")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let min_weight = arguments.get("min_weight").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let conn = index::open_db()?;
             match query::why(&conn, &name, min_weight)? {
                 Some(facts) => Ok(serde_json::to_string_pretty(&facts)?),
@@ -228,25 +119,13 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
         }
         "dangling" => {
             let conn = index::open_db()?;
-            let loops = query::dangling(
-                &conn,
-                arg_str("about").as_deref(),
-                arg_int("limit", 50) as usize,
-            )?;
+            let loops = query::dangling(&conn, arg_str("about").as_deref(), arg_int("limit", 50) as usize)?;
             Ok(serde_json::to_string_pretty(&loops)?)
         }
         "connect" => {
             let conn = index::open_db()?;
-            let min_weight = arguments
-                .get("min_weight")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.5);
-            let connections = query::connect(
-                &conn,
-                arg_int("min", 3),
-                min_weight,
-                arg_int("limit", 15) as usize,
-            )?;
+            let min_weight = arguments.get("min_weight").and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let connections = query::connect(&conn, arg_int("min", 3), min_weight, arg_int("limit", 15) as usize)?;
             Ok(serde_json::to_string_pretty(&connections)?)
         }
         "reindex" => {
@@ -255,13 +134,8 @@ fn call_tool(name: &str, arguments: &Value) -> Result<String> {
             Ok(format!(
                 "indexed {} notes, {} projects, {} entities, {} loops, {} edges \
                  (git: {} refreshed, {} reused from cache)",
-                stats.notes,
-                stats.projects,
-                stats.entities,
-                stats.loops,
-                stats.edges,
-                stats.git_refreshed,
-                stats.git_cached
+                stats.notes, stats.projects, stats.entities, stats.loops, stats.edges,
+                stats.git_refreshed, stats.git_cached
             ))
         }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),

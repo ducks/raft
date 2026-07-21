@@ -420,6 +420,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "mcp-stdio"
+version = "20260721.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91e932cb3a66f83ce10c09772774197f2ccb53726c789173b9e0272cc284787"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,6 +505,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "mcp-stdio",
  "regex",
  "rusqlite",
  "serde",
