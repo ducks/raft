@@ -4,6 +4,7 @@ mod extract;
 mod graph;
 mod index;
 mod mcp;
+mod publish;
 mod query;
 mod scan;
 
@@ -104,6 +105,16 @@ enum Command {
     Done {
         /// Substring of the loop's text (must match exactly one loop)
         pattern: String,
+    },
+    /// Compute what would be published (notes opted in via
+    /// `publish: true` frontmatter, repos allowlisted in config).
+    /// Emitting the site is not implemented yet; only --audit works.
+    Publish {
+        /// Print the manifest of everything that would go public
+        #[arg(long)]
+        audit: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Serve the graph to agents as an MCP server over stdio
     Serve,
@@ -314,6 +325,20 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Publish { audit, json } => {
+            if !audit {
+                println!("emit is not implemented yet; run `raft publish --audit`");
+                std::process::exit(2);
+            }
+            let cfg = config::Config::load()?;
+            let conn = index::open_db()?;
+            let plan = publish::plan(&conn, &cfg.publish)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_audit(&plan);
+            }
+        }
         Command::Serve => {
             mcp::serve()?;
         }
@@ -377,6 +402,49 @@ fn print_status(status: &index::IndexStatus) {
         println!("  {:9} {:5} {}", source.kind, state, source.path);
         if let Some(error) = &source.error {
             println!("                  {error}");
+        }
+    }
+}
+
+fn print_audit(plan: &publish::PublishPlan) {
+    println!(
+        "would publish: {} notes, {} projects, {} entities, {} loops, {} edges",
+        plan.notes.len(),
+        plan.projects.len(),
+        plan.entities.len(),
+        plan.loops.len(),
+        plan.edges.len()
+    );
+    if !plan.notes.is_empty() {
+        println!("\nnotes:");
+        for n in &plan.notes {
+            let date = n.note_date.as_deref().unwrap_or("          ");
+            println!("  {}  {}", date, n.path);
+        }
+    }
+    if !plan.projects.is_empty() {
+        println!("\nprojects:");
+        for p in &plan.projects {
+            println!("  {}", p.name);
+        }
+    }
+    if !plan.entities.is_empty() {
+        println!("\nentities:");
+        for e in &plan.entities {
+            println!("  {}", e.name);
+        }
+    }
+    if !plan.loops.is_empty() {
+        println!("\nopen loops:");
+        for l in &plan.loops {
+            println!("  {}  ({})", l.text, l.note_path);
+        }
+    }
+    if !plan.flags.is_empty() {
+        println!("\nFLAGS - need a decision before emit:");
+        for f in &plan.flags {
+            println!("  {}", f.reason);
+            println!("    in {}", f.note_path);
         }
     }
 }
