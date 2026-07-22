@@ -823,6 +823,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         let stats = rebuild_at(&config, &path).unwrap();
@@ -846,6 +847,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         assert!(rebuild_at(&config, &path).is_err());
@@ -915,6 +917,7 @@ mod tests {
             ],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -954,6 +957,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -980,6 +984,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         let stats = rebuild_at(&config, &live_path).unwrap();
@@ -1012,6 +1017,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
         rebuild_at(&config, &live_path).unwrap();
 
@@ -1041,6 +1047,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         };
 
         let status = status_at(&config, &live_path).unwrap();
@@ -1076,6 +1083,7 @@ mod tests {
             }],
             ignore: Vec::new(),
             daily_note: None,
+            publish: Default::default(),
         }
     }
 

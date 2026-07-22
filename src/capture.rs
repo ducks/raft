@@ -91,6 +91,7 @@ mod tests {
             sources: Vec::new(),
             ignore: Vec::new(),
             daily_note: Some(template.to_string()),
+            publish: Default::default(),
         }
     }
 

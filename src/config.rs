@@ -14,6 +14,22 @@ pub struct Config {
     /// `raft log`. Example: "~/notes/%Y/%Y-%m-%d.md"
     #[serde(default)]
     pub daily_note: Option<String>,
+    /// What `raft publish` is allowed to make public. Absent means
+    /// nothing beyond opted-in notes.
+    #[serde(default)]
+    pub publish: PublishConfig,
+}
+
+/// Publish consent that lives in config rather than in the content.
+/// Notes opt in individually via frontmatter; repos can't carry
+/// frontmatter, so they are allowlisted here. A public remote is not
+/// consent - commit messages leak.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PublishConfig {
+    /// Project names (as raft knows them, i.e. directory names) whose
+    /// git metadata may be published.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 // deny_unknown_fields catches a real TOML trap: top-level keys placed
