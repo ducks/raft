@@ -98,6 +98,12 @@ pub struct PublishPlan {
     /// link text itself would still be visible on the site, so these
     /// need a human decision before emit.
     pub flags: Vec<PlanFlag>,
+    /// Edges held back because exactly one endpoint is public. Owner-
+    /// facing audit information only: it tells you how many connections
+    /// the site will silently lack. Never serialized - the manifest is
+    /// the public artifact and must carry no shadow of private nodes.
+    #[serde(skip)]
+    pub dropped_edges: usize,
 }
 
 /// True if the note body opts into publishing: a leading `---`
@@ -283,6 +289,7 @@ pub fn plan(conn: &Connection, cfg: &PublishConfig) -> Result<PublishPlan> {
 
     // Stage 5: edges render only when both endpoints are public.
     let mut edges = Vec::new();
+    let mut dropped_edges = 0usize;
     {
         let mut stmt = conn.prepare(
             "SELECT src, dst, kind, provenance, weight, rationale
@@ -303,6 +310,14 @@ pub fn plan(conn: &Connection, cfg: &PublishConfig) -> Result<PublishPlan> {
             let (Some((src_kind, src_name)), Some((dst_kind, dst_name))) =
                 (public.get(&src), public.get(&dst))
             else {
+                // Held back because at least one endpoint is public but
+                // the other is not: the owner-facing audit reports how
+                // many backlinks the site will silently lack. Aggregate
+                // count only, and never serialized - the manifest stays
+                // shadow-free.
+                if public.contains_key(&src) || public.contains_key(&dst) {
+                    dropped_edges += 1;
+                }
                 continue;
             };
             edges.push(PlanEdge {
@@ -317,10 +332,10 @@ pub fn plan(conn: &Connection, cfg: &PublishConfig) -> Result<PublishPlan> {
             });
         }
         edges.sort_by(|a, b| {
-            (&a.src_kind, &a.src_name, &b.dst_kind, &a.dst_name, &a.kind).cmp(&(
+            (&a.src_kind, &a.src_name, &a.dst_kind, &a.dst_name, &a.kind).cmp(&(
                 &b.src_kind,
                 &b.src_name,
-                &a.dst_kind,
+                &b.dst_kind,
                 &b.dst_name,
                 &b.kind,
             ))
@@ -328,24 +343,28 @@ pub fn plan(conn: &Connection, cfg: &PublishConfig) -> Result<PublishPlan> {
     }
 
     // Stage 6: audit flags. A wiki link written in published prose
-    // renders its target's name even if the edge is dropped, so any
-    // target that didn't make it into the public set needs a human
-    // decision (rewrite the prose, publish the target, or accept it).
-    let public_names: HashSet<String> = public
-        .values()
-        .map(|(_, name)| extract::canonicalize(name))
+    // renders its target's name even if the edge is dropped, so it
+    // needs a human decision (rewrite the prose, publish the target,
+    // or accept it) unless the target is an allowlisted project. Only
+    // projects suppress a flag: an entity in the public set is derived
+    // from the very prose being audited (the link itself creates it),
+    // so its presence is not evidence of consent - and treating it as
+    // consent silently publishes private note titles as entity pages.
+    let public_projects: HashSet<String> = projects
+        .iter()
+        .map(|p| extract::canonicalize(&p.name))
         .collect();
     let mut flags = Vec::new();
     for note in &notes {
         let extraction = extract::extract(&note.body, &HashSet::new());
         for target in extraction.wiki_links {
-            if !public_names.contains(&extract::canonicalize(&target)) {
+            if !public_projects.contains(&extract::canonicalize(&target)) {
                 flags.push(PlanFlag {
                     note_path: note.path.clone(),
                     target: target.clone(),
                     reason: format!(
-                        "published prose links [[{target}]], which is not public; \
-                         the name itself will be visible"
+                        "published prose links [[{target}]], whose target is not \
+                         a public project; the name itself will be visible"
                     ),
                 });
             }
@@ -360,6 +379,7 @@ pub fn plan(conn: &Connection, cfg: &PublishConfig) -> Result<PublishPlan> {
         loops,
         edges,
         flags,
+        dropped_edges,
     })
 }
 
@@ -598,6 +618,65 @@ mod tests {
         assert_eq!(plan.flags[0].target, "Visa Plan");
     }
 
+    #[test]
+    fn entity_mirroring_private_note_title_still_flags() {
+        // Regression for the closure hole found dogfooding: a wiki link
+        // to a private note materializes an entity with the note's
+        // title; that entity going public must not suppress the flag,
+        // or private titles publish with zero review.
+        let conn = open_in_memory().unwrap();
+        let body = "---\npublish: true\n---\nsee [[secret plan]]\n";
+        let note = insert_note(&conn, "/n/public.md", body);
+        insert_note(&conn, "/n/secret-plan.md", "# secret plan\nprivate\n");
+        let entity = insert_entity(&conn, "secret plan", r#"{"display":"secret plan"}"#);
+        insert_edge(&conn, note, entity, "wikilink");
+
+        let plan = plan(&conn, &cfg(&[])).unwrap();
+
+        // The entity is in the manifest (its name is already in public
+        // prose), but the flag must fire so a human decides before emit.
+        assert_eq!(plan.entities.len(), 1);
+        assert_eq!(plan.flags.len(), 1);
+        assert_eq!(plan.flags[0].target, "secret plan");
+    }
+
+    // --- dropped-edge accounting ------------------------------------------
+
+    #[test]
+    fn dropped_edges_counts_half_public_only() {
+        let conn = open_in_memory().unwrap();
+        let pub_note = insert_note(&conn, "/n/public.md", PUBLIC_BODY);
+        let priv_a = insert_note(&conn, "/n/priv-a.md", "# A\n");
+        let priv_b = insert_note(&conn, "/n/priv-b.md", "# B\n");
+        let pub_proj = insert_project(&conn, "raft", "{}");
+        let priv_proj = insert_project(&conn, "secret", "{}");
+        insert_edge(&conn, pub_note, pub_proj, "mentions"); // kept
+        insert_edge(&conn, pub_note, priv_proj, "mentions"); // dropped: dst private
+        insert_edge(&conn, priv_a, pub_proj, "mentions"); // dropped: src private
+        insert_edge(&conn, priv_a, priv_b, "mentions"); // fully private: not counted
+
+        let plan = plan(&conn, &cfg(&["raft"])).unwrap();
+
+        assert_eq!(plan.edges.len(), 1);
+        assert_eq!(plan.dropped_edges, 2);
+    }
+
+    #[test]
+    fn dropped_edges_never_serialized() {
+        let conn = open_in_memory().unwrap();
+        let pub_note = insert_note(&conn, "/n/public.md", PUBLIC_BODY);
+        let priv_proj = insert_project(&conn, "secret", "{}");
+        insert_edge(&conn, pub_note, priv_proj, "mentions");
+
+        let plan = plan(&conn, &cfg(&[])).unwrap();
+
+        assert_eq!(plan.dropped_edges, 1);
+        // The manifest JSON is the public artifact: no field, no count.
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("dropped"));
+        assert!(!json.contains("secret"));
+    }
+
     // --- determinism -----------------------------------------------------
 
     #[test]
@@ -621,6 +700,25 @@ mod tests {
             .map(|n| n["path"].as_str().unwrap())
             .collect();
         assert_eq!(paths, vec!["/n/a.md", "/n/b.md"]);
+    }
+
+    #[test]
+    fn edges_sort_lexicographically_regardless_of_insertion_order() {
+        // Regression: the first comparator mixed a/b fields, so edges
+        // differing only in dst could order inconsistently.
+        let conn = open_in_memory().unwrap();
+        let note = insert_note(&conn, "/n/public.md", PUBLIC_BODY);
+        let p_z = insert_project(&conn, "zola", "{}");
+        let p_a = insert_project(&conn, "argo", "{}");
+        let p_m = insert_project(&conn, "mid", "{}");
+        insert_edge(&conn, note, p_z, "mentions");
+        insert_edge(&conn, note, p_a, "mentions");
+        insert_edge(&conn, note, p_m, "mentions");
+
+        let plan = plan(&conn, &cfg(&["zola", "argo", "mid"])).unwrap();
+
+        let dsts: Vec<&str> = plan.edges.iter().map(|e| e.dst_name.as_str()).collect();
+        assert_eq!(dsts, vec!["argo", "mid", "zola"]);
     }
 
     #[test]
