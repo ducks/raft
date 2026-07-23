@@ -113,6 +113,11 @@ enum Command {
         /// Print the manifest of everything that would go public
         #[arg(long)]
         audit: bool,
+        /// Exit non-zero if the audit finds flags needing a decision.
+        /// The gate for scripted publishes: `raft publish --audit
+        /// --strict && <emit/deploy>`
+        #[arg(long)]
+        strict: bool,
         #[arg(long)]
         json: bool,
     },
@@ -325,7 +330,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Publish { audit, json } => {
+        Command::Publish {
+            audit,
+            strict,
+            json,
+        } => {
             if !audit {
                 println!("emit is not implemented yet; run `raft publish --audit`");
                 std::process::exit(2);
@@ -337,6 +346,13 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print_audit(&plan);
+            }
+            if strict && !plan.flags.is_empty() {
+                eprintln!(
+                    "audit: {} flag(s) need a decision before publishing",
+                    plan.flags.len()
+                );
+                std::process::exit(1);
             }
         }
         Command::Serve => {
@@ -415,6 +431,12 @@ fn print_audit(plan: &publish::PublishPlan) {
         plan.loops.len(),
         plan.edges.len()
     );
+    if plan.dropped_edges > 0 {
+        println!(
+            "held back:     {} edge(s) whose other endpoint is private",
+            plan.dropped_edges
+        );
+    }
     if !plan.notes.is_empty() {
         println!("\nnotes:");
         for n in &plan.notes {
@@ -438,6 +460,19 @@ fn print_audit(plan: &publish::PublishPlan) {
         println!("\nopen loops:");
         for l in &plan.loops {
             println!("  {}  ({})", l.text, l.note_path);
+        }
+    }
+    if !plan.edges.is_empty() {
+        println!("\nedges:");
+        for e in &plan.edges {
+            println!(
+                "  {:.2}  {:<8} {:<10} {} -> {}",
+                e.weight,
+                e.provenance,
+                e.kind,
+                shorten_source(&e.src_name, &e.src_kind),
+                shorten_source(&e.dst_name, &e.dst_kind)
+            );
         }
     }
     if !plan.flags.is_empty() {
