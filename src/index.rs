@@ -975,8 +975,8 @@ mod tests {
         std::fs::create_dir(&notes).unwrap();
         let older_path = notes.join("2026-07-01.md");
         let newer_path = notes.join("2026-07-10.md");
-        std::fs::write(&older_path, "## Next steps\n- write tests\n").unwrap();
-        std::fs::write(&newer_path, "## Follow-ups\n- write tests\n").unwrap();
+        std::fs::write(&older_path, "## Next steps\n- [ ] write tests\n").unwrap();
+        std::fs::write(&newer_path, "## Follow-ups\n- [ ] write tests\n").unwrap();
         let config = Config {
             sources: vec![crate::config::Source {
                 path: notes.to_string_lossy().into_owned(),
