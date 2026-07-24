@@ -93,11 +93,33 @@ fn js_def_re() -> &'static Regex {
     })
 }
 
+/// Skip a leading closed frontmatter block. Frontmatter is metadata,
+/// not prose: keys like `tags: [raft]` must not become project
+/// mentions or entities. An unterminated block is left alone (lint's
+/// problem, not extraction's).
+pub fn strip_frontmatter(body: &str) -> &str {
+    let Some(rest) = body
+        .strip_prefix("---\n")
+        .or_else(|| body.strip_prefix("---\r\n"))
+    else {
+        return body;
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return &rest[offset + line.len()..];
+        }
+        offset += line.len();
+    }
+    body // unterminated: treat as content
+}
+
 pub fn extract(body: &str, project_names: &HashSet<String>) -> Extraction {
     let mut out = Extraction::default();
 
-    // Strip fenced code blocks so their contents don't pollute extraction.
-    let prose = strip_fences(body);
+    // Strip frontmatter (metadata, not prose), then fenced code blocks,
+    // so neither pollutes extraction.
+    let prose = strip_fences(strip_frontmatter(body));
 
     for cap in wiki_link_re().captures_iter(&prose) {
         let target = cap[1].trim().to_string();
@@ -187,32 +209,20 @@ fn header_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap())
 }
 
-fn followup_header_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)(follow.?ups?|next steps?|todos?|loose ends?|open (?:questions?|threads?|loops?)|\bnext\b)")
-            .unwrap()
-    })
-}
-
 fn checkbox_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+\[( |x|X)\]\s+(.+)$").unwrap())
 }
 
-fn bullet_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+(.+)$").unwrap())
-}
-
-/// Extract open loops from a note body. Unchecked checkboxes count
-/// anywhere; plain bullets count only under follow-up style headers.
-/// Checked boxes are done and skipped. Continuation lines (indented
-/// non-bullet text) are folded into the preceding item.
+/// Extract open loops from a note body. Per the strict note format
+/// (reference/note-format.md), `- [ ]` is the one loop syntax,
+/// recognized anywhere; checked boxes are done and skipped. Plain
+/// bullets are never loops - completion and loop-ness live in the
+/// syntax, not in header heuristics or prose markers. Continuation
+/// lines (indented non-bullet text) fold into the preceding item.
 pub fn extract_loops(body: &str) -> Vec<Loop> {
     let mut loops: Vec<Loop> = Vec::new();
     let mut current_header: Option<String> = None;
-    let mut in_followup_section = false;
     let mut in_fence = false;
     let mut open_item = false;
 
@@ -227,9 +237,7 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
         }
 
         if let Some(cap) = header_re().captures(line) {
-            let title = cap[2].trim().to_string();
-            in_followup_section = followup_header_re().is_match(&title);
-            current_header = Some(title);
+            current_header = Some(cap[2].trim().to_string());
             open_item = false;
             continue;
         }
@@ -247,40 +255,16 @@ pub fn extract_loops(body: &str) -> Vec<Loop> {
             continue;
         }
 
-        if in_followup_section {
-            if let Some(cap) = bullet_re().captures(line) {
-                loops.push(Loop {
-                    text: cap[1].trim().to_string(),
-                    section: current_header.clone(),
-                    line: line_idx,
-                });
-                open_item = true;
-                continue;
+        // Fold indented continuation lines into the open item.
+        if open_item && line.starts_with("  ") && !line.trim().is_empty() {
+            if let Some(last) = loops.last_mut() {
+                last.text.push(' ');
+                last.text.push_str(line.trim());
             }
-            // Fold indented continuation lines into the open item.
-            if open_item && line.starts_with("  ") && !line.trim().is_empty() {
-                if let Some(last) = loops.last_mut() {
-                    last.text.push(' ');
-                    last.text.push_str(line.trim());
-                }
-                continue;
-            }
-            open_item = false;
-        } else {
-            open_item = false;
+            continue;
         }
+        open_item = false;
     }
-
-    // Items hand-marked as finished in prose still show up here;
-    // drop the common completion markers.
-    loops.retain(|l| {
-        let lower = l.text.to_lowercase();
-        !l.text.contains('✓')
-            && !l.text.contains("~~")
-            && !lower.contains("(completed)")
-            && !lower.contains("(done)")
-            && !lower.starts_with("done:")
-    });
 
     loops
 }
@@ -441,35 +425,25 @@ mod tests {
     }
 
     #[test]
-    fn loops_plain_bullets_only_under_followup_headers() {
-        let body = "# Notes\n- just a note\n## Next steps\n- ship it\n";
+    fn loops_plain_bullets_are_never_loops() {
+        // Strict format: loop-ness lives in the checkbox syntax, not in
+        // header heuristics. Bullets under "Next steps" style headers
+        // are prose.
+        let body = "# Notes\n- just a note\n## Next steps\n- ship it\n## TODO\n- also not\n";
+        assert!(extract_loops(body).is_empty());
+    }
+
+    #[test]
+    fn loops_checkbox_carries_its_section() {
+        let body = "## Next steps\n- [ ] ship it\n";
         let loops = extract_loops(body);
-        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(texts, vec!["ship it"]);
+        assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].section.as_deref(), Some("Next steps"));
     }
 
     #[test]
-    fn loops_followup_header_variants_match() {
-        for header in [
-            "## Follow-ups",
-            "## TODO",
-            "## Loose ends",
-            "## Open questions",
-        ] {
-            let body = format!("{header}\n- an item\n");
-            let loops = extract_loops(&body);
-            assert_eq!(
-                loops.len(),
-                1,
-                "header {header:?} should open a loop section"
-            );
-        }
-    }
-
-    #[test]
     fn loops_fold_indented_continuation_lines() {
-        let body = "## Next\n- do a thing\n  with more detail\n";
+        let body = "## Next\n- [ ] do a thing\n  with more detail\n";
         let loops = extract_loops(body);
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].text, "do a thing with more detail");
@@ -484,19 +458,37 @@ mod tests {
     }
 
     #[test]
-    fn loops_drop_completion_markers() {
-        let body = "## Next\n- [ ] done: shipped it\n- [ ] ~~scrapped~~\n- [ ] real one\n";
+    fn loops_completion_is_the_checkbox_not_prose_markers() {
+        // Strict format: done means [x]. Prose markers no longer filter.
+        let body = "## Next\n- [x] shipped it\n- [ ] real one\n";
         let loops = extract_loops(body);
         let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["real one"]);
     }
 
+    // --- frontmatter --------------------------------------------------------
+
     #[test]
-    fn loops_header_resets_followup_section() {
-        // A non-followup header after a followup one stops plain-bullet capture.
-        let body = "## Next steps\n- captured\n## Random\n- not captured\n";
-        let loops = extract_loops(body);
-        let texts: Vec<&str> = loops.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(texts, vec!["captured"]);
+    fn strip_frontmatter_removes_closed_block() {
+        let body = "---\ntitle: x\npublish: false\n---\nreal prose\n";
+        assert_eq!(strip_frontmatter(body), "real prose\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_leaves_unterminated_and_absent_alone() {
+        assert_eq!(strip_frontmatter("no frontmatter\n"), "no frontmatter\n");
+        let unterminated = "---\ntitle: x\nbody\n";
+        assert_eq!(strip_frontmatter(unterminated), unterminated);
+        // A thematic break later in the body is not frontmatter.
+        let mid = "prose\n---\nmore\n";
+        assert_eq!(strip_frontmatter(mid), mid);
+    }
+
+    #[test]
+    fn extract_ignores_frontmatter_content() {
+        // tags/keys in frontmatter must not become mentions or entities.
+        let body = "---\ntags: [replaybook]\npublish: false\n---\nprose only\n";
+        let e = extract(body, &names(&["replaybook"]));
+        assert!(e.project_mentions.is_empty());
     }
 }

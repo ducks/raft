@@ -44,9 +44,10 @@ pub fn append_log(config: &Config, text: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Mark an open loop done in every note that contains it: checkboxes
-/// flip to `[x]`, plain follow-up bullets get a `(done)` marker (which
-/// the extractor treats as closed). Returns the files changed.
+/// Mark an open loop done in every note that contains it by flipping
+/// its checkbox to `[x]`. Loops are checkbox-only under the strict
+/// note format, so that is the whole mechanism. Returns the files
+/// changed.
 pub fn mark_done(loop_text: &str, note_paths: &[String]) -> Result<Vec<String>> {
     let mut changed = Vec::new();
 
@@ -65,11 +66,7 @@ pub fn mark_done(loop_text: &str, note_paths: &[String]) -> Result<Vec<String>> 
 
         let mut lines: Vec<String> = body.lines().map(String::from).collect();
         let line = &mut lines[target.line];
-        if line.contains("[ ]") {
-            *line = line.replacen("[ ]", "[x]", 1);
-        } else {
-            line.push_str(" (done)");
-        }
+        *line = line.replacen("[ ]", "[x]", 1);
 
         let mut new_body = lines.join("\n");
         if body.ends_with('\n') {
@@ -129,14 +126,13 @@ mod tests {
     }
 
     #[test]
-    fn marks_followup_bullet_done() {
+    fn plain_bullets_are_not_loops_so_mark_done_skips_them() {
+        // Strict format: bullets under follow-up headers are prose.
+        // mark_done finds nothing to close and touches nothing.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.md");
-        std::fs::write(
-            &path,
-            "# note\n\n## Follow-ups\n\n- unpin try after vacation\n- roll the container\n",
-        )
-        .unwrap();
+        let body = "# note\n\n## Follow-ups\n\n- unpin try after vacation\n";
+        std::fs::write(&path, body).unwrap();
 
         let changed = mark_done(
             "unpin try after vacation",
@@ -144,14 +140,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(changed.len(), 1);
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("- unpin try after vacation (done)"));
-        assert!(body.contains("- roll the container\n"));
-        // Round-trip: the extractor no longer sees it as open.
-        let still_open = extract::extract_loops(&body);
-        assert!(!still_open.iter().any(|l| l.text.starts_with("unpin try")));
-        assert!(still_open.iter().any(|l| l.text == "roll the container"));
+        assert!(changed.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
     }
 
     #[test]

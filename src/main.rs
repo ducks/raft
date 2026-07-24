@@ -3,6 +3,7 @@ mod config;
 mod extract;
 mod graph;
 mod index;
+mod lint;
 mod mcp;
 mod publish;
 mod query;
@@ -105,6 +106,13 @@ enum Command {
     Done {
         /// Substring of the loop's text (must match exactly one loop)
         pattern: String,
+    },
+    /// Check every note against the strict note format
+    /// (frontmatter with explicit publish key, daily H1 dates,
+    /// fenced config, well-formed checkboxes)
+    Lint {
+        #[arg(long)]
+        json: bool,
     },
     /// Compute what would be published (notes opted in via
     /// `publish: true` frontmatter, repos allowlisted in config).
@@ -328,6 +336,27 @@ fn main() -> Result<()> {
                         println!("  - {text}");
                     }
                 }
+            }
+        }
+        Command::Lint { json } => {
+            let cfg = config::Config::load()?;
+            let issues = lint::lint_all(&cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&issues)?);
+            } else if issues.is_empty() {
+                println!("all notes conform to the format");
+            } else {
+                for i in &issues {
+                    if i.line > 0 {
+                        println!("{}:{}  [{}] {}", i.path, i.line, i.rule, i.message);
+                    } else {
+                        println!("{}  [{}] {}", i.path, i.rule, i.message);
+                    }
+                }
+                eprintln!("{} issue(s)", issues.len());
+            }
+            if !issues.is_empty() {
+                std::process::exit(1);
             }
         }
         Command::Publish {
